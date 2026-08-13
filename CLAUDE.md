@@ -45,29 +45,53 @@ cloud credential storage, and anything else that assumes connectivity.
 ## Architecture
 
 **Hybrid client-server. Local Core Engine is a modular monolith** (explicitly
-not microservices — keep it simple, one process, one deployable).
+not microservices — keep it simple, one process, one deployable). Full
+reference diagram: the "Network Diagnostic App — Final Architecture"
+flowchart Ammar provided (rendered as Panel 01 in the Core Engine Console
+dashboard artifact — keep that panel in sync with this section).
 
 | Module | Name | Role |
 |---|---|---|
-| A1 | Discovery | Finds devices on the network (IP/MAC/vendor/hostname/open ports/role) |
-| A2 | Rule Engine | Turns raw discovery data into structured findings/diagnoses |
-| AI1 | AI Advisory Layer | **Deferred to post-v1.** Runs locally on-device (never cloud — see constraint above). Takes A1's raw data + A2's findings, outputs confidence-scored *suggestions only* — never executes fixes itself |
-| A3 | Fix Engine | Executes fixes. Must be idempotent, and has a circuit-breaker to stop runaway/looping fix attempts |
-| A4 | Snapshot/Rollback Manager | Takes a snapshot before any fix, can roll back |
-| A5 | Report Generator | Human-readable output for non-technical users |
-| A6 | Encrypted local cache | SQLite, encrypted at rest. **All modules write here first** |
-| A7 | Sync Layer | The *only* module allowed to touch the internet. Opportunistically pushes logs when online, pulls updated rules/retrained AI models back down and hands them to A2/A3 locally |
+| A1 | Discovery | Finds devices on the network. Current: ARP, ping, hostname, MAC vendor, port probing, Wi-Fi scan. Planned additions: mDNS, SNMP |
+| A2 | Rule Engine | Deterministic known-issue rules. Decides what needs fixing from A1's structured data |
+| AI1 | AI Advisory Layer | **Deferred to post-v1.** Runs locally on-device (never cloud — see constraint above). Does anomaly detection on A1's raw data and correlation on A2's findings, outputs confidence-scored *suggestions only* — never executes fixes itself. Versioned, with rollback, same as rules |
+| A3 | Fix Engine | Executes fixes, classified per-finding as **auto-fix**, **guided-fix**, or **not-fixable**. Idempotent, with a circuit-breaker that stops itself if a fix loops. Draws credentials from the Credential Manager |
+| A4 | Snapshot/Rollback Manager | Pre-fix snapshot before A3 touches anything, config rollback on demand, and **auto-rollback if the device becomes unreachable** after a fix attempt |
+| A5 | Report Generator | Plain-language findings for non-technical users, with an **offline template fallback** (canned templates) if nothing richer is available |
+| A6 | Encrypted local cache | SQLite, encrypted at rest. **Every module writes here first** — scan data, findings, fix outcomes, snapshots, AI suggestions, reports |
+| A7 | Sync Layer | The *only* module allowed to touch the internet, and it's opportunistic/optional — never required for a fix to work. **Push:** logs + fix outcomes (queued if offline). **Pull:** updated rules + retrained AI models, handed off to A2/A3 (and AI1) locally |
+
+**Client UI — Local App Screen:** what the customer actually sees on the
+device. Shows the topology map and findings (pulled from A6), and the
+Fix/Rollback buttons the customer clicks, which call into A3/A4.
 
 **Data flow:** every module writes to A6 first. Only A7 ever touches the
-internet. Nothing else is allowed to make an outbound call — that's not a
-style preference, it's the core offline-first constraint.
+internet, and only opportunistically. Nothing else is allowed to make an
+outbound call — that's not a style preference, it's the core offline-first
+constraint.
 
-**Credential Manager** lives locally inside the Core Engine (not the cloud),
-so fixes on managed devices still work during an outage.
+**Credential Manager** lives locally inside the Core Engine (not the cloud) —
+device/router login credentials, encrypted at rest, never leave the device.
+Feeds A3 so fixes on managed devices still work during an outage.
 
 **Safeguards that are non-negotiable:** idempotent fixes, circuit-breaker on
-fix attempts, versioned rules/AI models with rollback, encrypted credentials
-at rest.
+fix attempts, auto-rollback if a fixed device goes unreachable, versioned
+rules/AI models with rollback, encrypted credentials at rest.
+
+### Cloud Backend (optional, opportunistic — never required for a fix)
+
+Only ever reached through A7. Stack: **FastAPI monolith** in front of
+**PostgreSQL**. Pieces:
+
+- **Auth Module** — remote dashboard login only, nothing device-local depends on it
+- **Rule Repository** — master copy of the rules A2 runs, versioned with rollback, pulled down by A7
+- **AI Model Training** — retrains AI1's models from aggregated, anonymized outcome data pushed up by A7
+- **PostgreSQL** — users, scans, findings, fix history
+- **Web Dashboard** — remote view of a customer's network for the business (MSP-style oversight), **requires internet**, separate from the on-device Local App Screen
+
+The cloud backend existing at all doesn't weaken the offline constraint: the
+Core Engine has to fully diagnose and fix without it, and the backend only
+ever sees what A7 chooses to push, on its own schedule.
 
 ## Current state
 
@@ -120,8 +144,12 @@ Everything else (A2 through A7) is not started yet.
 ## On the horizon
 
 - Expand the MAC vendor OUI table (known gap, flagged above)
+- Add mDNS and SNMP to A1's discovery methods (currently ARP/ping/hostname/
+  port-probe/Wi-Fi only)
 - Build out A2 (Rule Engine) on top of A1's output
-- Eventually A3/A4 (Fix Engine + Rollback) — idempotency and circuit-breaker
-  logic matter a lot here, don't skip them for speed
+- A4 (Snapshot/Rollback) before A3 (Fix Engine) — rollback has to exist
+  before anything is allowed to touch a device's config
 - AI layer (AI1) stays deferred until after a working core (A1-A7 minus AI1)
   exists end-to-end
+- Cloud backend (FastAPI + PostgreSQL) is last — it's opportunistic/optional
+  by design, so it shouldn't block or shape the on-device core
