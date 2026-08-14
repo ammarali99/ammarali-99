@@ -109,10 +109,18 @@ a non-technical install target later). Current version does:
 - Common-port probing (22/23/53/80/443/8080) to guess device role
   (router/gateway, web-admin device, SSH host, end-user device)
 - Wi-Fi network scanning (SSID/signal/channel/security) via OS-native tools
-  — `netsh` on Windows, `nmcli`/`iwlist` on Linux, `networksetup` on macOS
-  (macOS can only report the *currently connected* network — Apple removed
-  the nearby-scan tool `airport` from recent macOS versions, this is a
-  platform limitation, not a bug)
+  — `netsh` on Windows, `nmcli`/`iw`/`iwlist` on Linux (tried in that
+  order), `networksetup` on macOS (macOS can only report the *currently
+  connected* network — Apple removed the nearby-scan tool `airport` from
+  recent macOS versions, this is a platform limitation, not a bug). Every
+  scan failure now reports the actual error instead of failing silently
+  — v0.1.0 swallowed all exceptions, so a broken scan looked identical to
+  "zero networks found" (real bug, caught by Ammar testing on real
+  hardware)
+- Wi-Fi channel recommendation: `suggest_best_channel()` looks at every
+  network the scan found and recommends the least congested 2.4GHz
+  channel (only ever from 1/6/11, the non-overlapping set) and 5GHz
+  channel
 - JSON export (`--json`) in the shape that will eventually be handed to A6
   directly instead of a file
 - `--no-ports` / `--no-wifi` flags to skip slower steps
