@@ -3,8 +3,24 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.7.0
+VERSION: 0.8.0
 CHANGELOG:
+  0.8.0 - query_upnp_gateway() was printing whatever the router's UPnP
+          stack returned as if it were trustworthy, and on Ammar's real
+          Tenda router it wasn't: external_ip came back as a *private*
+          address (192.168.100.2 -- a real WAN IP can't be private,
+          this means the router is itself behind another router/NAT,
+          common with FTTH ONT/modem combos), uptime_seconds came back
+          as ~26.6 years (impossible, a firmware counter bug), and
+          total_bytes_received came back as exactly 2^32-1 (the classic
+          signature of an overflowed/wrapped 32-bit counter, or a
+          "not really supported" sentinel value). None of these were
+          flagged -- they just got printed next to the genuinely good
+          data (external IP format, connection status) as if all of it
+          were equally trustworthy. Added _upnp_sanity_notes(), which
+          checks for exactly these three patterns and surfaces them as
+          plain-language notes instead of silently trusting whatever
+          the router's firmware says.
   0.7.0 - query_upnp_gateway(): talks to the router itself via UPnP IGD
           (Internet Gateway Device) -- a real, standardized protocol
           most consumer routers (Tenda/TP-Link included) support, and
@@ -128,10 +144,10 @@ CHANGELOG:
 
 Standard-library only. No pip installs, on purpose -- see CLAUDE.md for why.
 
-Run it directly:  python3 network_discovery_v0.7.0.py
-Skip the slow steps while testing:  python3 network_discovery_v0.7.0.py --no-ports --no-wifi
-Stay fully offline, no exceptions: python3 network_discovery_v0.7.0.py --no-internet
-Dump machine-readable output:       python3 network_discovery_v0.7.0.py --json out.json
+Run it directly:  python3 network_discovery_v0.8.0.py
+Skip the slow steps while testing:  python3 network_discovery_v0.8.0.py --no-ports --no-wifi
+Stay fully offline, no exceptions: python3 network_discovery_v0.8.0.py --no-internet
+Dump machine-readable output:       python3 network_discovery_v0.8.0.py --json out.json
 
 Note on Wi-Fi scanning permissions: on Linux, actually triggering a scan
 (as opposed to reading a cached list) usually needs root. If you see a
@@ -986,6 +1002,68 @@ def _soap_call(control_url, service_type, action, timeout=3.0):
     return result
 
 
+# Cheap consumer routers' UPnP stacks are frequently buggy -- these are
+# the specific, recognizable ways that shows up in practice (see
+# _upnp_sanity_notes()), not an exhaustive validity check.
+_UPNP_MAX_UINT32 = 2**32 - 1
+_UPNP_IMPLAUSIBLE_UPTIME_SECONDS = 5 * 365 * 24 * 3600  # ~5 years
+
+
+def _upnp_sanity_notes(info):
+    """
+    UPnP IGD implementations on cheap consumer routers are frequently
+    buggy. A response can be well-formed and still be nonsense -- this
+    checks for the specific ways that showed up on Ammar's real Tenda
+    router (a "external" IP that's actually private, an uptime of
+    decades, a traffic counter sitting at exactly 2^32-1) and returns
+    plain-language notes about them, instead of silently printing
+    whatever the firmware said as if it were trustworthy.
+    """
+    notes = []
+
+    ext_ip = info.get("external_ip")
+    if ext_ip:
+        try:
+            if ipaddress.ip_address(ext_ip).is_private:
+                notes.append(
+                    f"external_ip ({ext_ip}) is itself a private address -- a real WAN IP "
+                    "can't be private. This router is behind another router/NAT (double-NAT), "
+                    "common with some FTTH ONT/modem setups. Port forwarding may need to "
+                    "happen on the upstream device instead."
+                )
+        except ValueError:
+            pass
+
+    uptime = info.get("uptime_seconds")
+    if uptime is not None:
+        try:
+            uptime_int = int(uptime)
+            if uptime_int > _UPNP_IMPLAUSIBLE_UPTIME_SECONDS:
+                years = round(uptime_int / (365 * 24 * 3600), 1)
+                notes.append(
+                    f"uptime_seconds ({uptime_int}, about {years} years) is implausible for a "
+                    "home router -- almost certainly a bug in this router's UPnP firmware, not "
+                    "a real reading."
+                )
+        except (TypeError, ValueError):
+            pass
+
+    for key in ("total_bytes_sent", "total_bytes_received"):
+        val = info.get(key)
+        if val is not None:
+            try:
+                if int(val) == _UPNP_MAX_UINT32:
+                    notes.append(
+                        f"{key} is exactly 2^32-1 -- the signature of either an overflowed/"
+                        "wrapped 32-bit counter or a \"not really supported\" sentinel value. "
+                        "Not a reliable measurement."
+                    )
+            except (TypeError, ValueError):
+                pass
+
+    return notes
+
+
 def query_upnp_gateway(timeout=3.0):
     """
     Talks to the router via UPnP IGD (Internet Gateway Device) -- a real,
@@ -1006,6 +1084,9 @@ def query_upnp_gateway(timeout=3.0):
     unverified against real hardware -- not every router implements it,
     and a missing/failed result there is treated as "not available,"
     not an error, since it's a bonus on top of the core WAN info.
+
+    A successful response isn't necessarily a *trustworthy* one -- see
+    _upnp_sanity_notes(), which info["notes"] holds the output of.
 
     Returns (info, errors). info is {} if no IGD was found at all.
     """
@@ -1066,6 +1147,7 @@ def query_upnp_gateway(timeout=3.0):
         if received and "NewTotalBytesReceived" in received:
             info["total_bytes_received"] = received["NewTotalBytesReceived"]
 
+    info["notes"] = _upnp_sanity_notes(info)
     return info, errors
 
 
@@ -1618,6 +1700,8 @@ def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False, skip_u
         if upnp_gateway.get("total_bytes_sent") or upnp_gateway.get("total_bytes_received"):
             print(f"  Traffic:     sent={upnp_gateway.get('total_bytes_sent', '?')} "
                   f"received={upnp_gateway.get('total_bytes_received', '?')}")
+        for note in upnp_gateway.get("notes", []):
+            print(f"  ! {note}")
 
     return {
         "local_ip": local_ip,

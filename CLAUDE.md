@@ -190,6 +190,15 @@ a non-technical install target later). Current version does:
   approach flagged below. Doesn't get the DHCP client list or the
   router's actual configured DHCP range; UPnP doesn't expose that (see
   Flagged decisions). Skippable with `--no-upnp`
+- UPnP response sanity-checking (`_upnp_sanity_notes()`) — a successful
+  UPnP response isn't necessarily a *trustworthy* one. Caught on Ammar's
+  real Tenda router: `external_ip` came back as a private address
+  (double-NAT — this router is itself behind another router, common with
+  FTTH ONT/modem setups), `uptime_seconds` came back as ~26.6 years
+  (impossible — a firmware counter bug), and a traffic byte counter came
+  back as exactly 2^32-1 (an overflowed/wrapped 32-bit counter, or a
+  "not really supported" sentinel). All three are now flagged in plain
+  language instead of printed as if they were real data
 - JSON export (`--json`) in the shape that will eventually be handed to A6
   directly instead of a file
 - `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` flags to
