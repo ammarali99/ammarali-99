@@ -3,8 +3,26 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.6.0
+VERSION: 0.7.0
 CHANGELOG:
+  0.7.0 - query_upnp_gateway(): talks to the router itself via UPnP IGD
+          (Internet Gateway Device) -- a real, standardized protocol
+          most consumer routers (Tenda/TP-Link included) support, and
+          one that's normally unauthenticated on the LAN by design (it
+          exists so any app can request port-forwarding without a login
+          prompt). No router credentials needed, unlike the admin panel.
+          SSDP-discovers the device, fetches its description XML, finds
+          the WANIPConnection/WANPPPConnection service, and calls
+          GetExternalIPAddress / GetStatusInfo over SOAP; also tries
+          WANCommonInterfaceConfig for traffic byte counters if present
+          (best-effort -- not verified against real hardware, wrapped so
+          a failure there doesn't affect the rest). Skippable with
+          --no-upnp.
+          This does NOT get the DHCP client list or the router's actual
+          configured DHCP range -- UPnP doesn't expose that. Getting it
+          would need logging into the router's own web admin panel and
+          scraping undocumented, per-model endpoints -- flagged, not
+          built, see CLAUDE.md's "Flagged / open decisions."
   0.6.0 - Three additions Claude suggested and Ammar approved:
             - check_gateway_latency(): pings the gateway a handful of
               times (not just once) for real signal on connection
@@ -110,10 +128,10 @@ CHANGELOG:
 
 Standard-library only. No pip installs, on purpose -- see CLAUDE.md for why.
 
-Run it directly:  python3 network_discovery_v0.6.0.py
-Skip the slow steps while testing:  python3 network_discovery_v0.6.0.py --no-ports --no-wifi
-Stay fully offline, no exceptions: python3 network_discovery_v0.6.0.py --no-internet
-Dump machine-readable output:       python3 network_discovery_v0.6.0.py --json out.json
+Run it directly:  python3 network_discovery_v0.7.0.py
+Skip the slow steps while testing:  python3 network_discovery_v0.7.0.py --no-ports --no-wifi
+Stay fully offline, no exceptions: python3 network_discovery_v0.7.0.py --no-internet
+Dump machine-readable output:       python3 network_discovery_v0.7.0.py --json out.json
 
 Note on Wi-Fi scanning permissions: on Linux, actually triggering a scan
 (as opposed to reading a cached list) usually needs root. If you see a
@@ -129,6 +147,10 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 # Ports we probe on every live host, and what finding an open one suggests
@@ -835,6 +857,218 @@ def check_internet_reachability(targets=INTERNET_CHECK_TARGETS, timeout=2.0):
     return {"reachable": reachable, "checks": checks}
 
 
+# UPnP IGD (Internet Gateway Device) -- see query_upnp_gateway() below for
+# what this is and why it needs no router credentials.
+_SSDP_ADDR = "239.255.255.250"
+_SSDP_PORT = 1900
+_UPNP_DEVICE_NS = "urn:schemas-upnp-org:device-1-0"
+
+
+def _ssdp_discover(timeout=3.0):
+    """
+    Sends a UPnP SSDP M-SEARCH multicast request and collects LOCATION
+    URLs from any Internet Gateway Device that answers. This is the
+    standard way UPnP devices are found on a LAN -- no credentials, no
+    prior knowledge of the router's IP needed, just a multicast question
+    on the local network.
+    """
+    request = "\r\n".join([
+        "M-SEARCH * HTTP/1.1",
+        f"HOST: {_SSDP_ADDR}:{_SSDP_PORT}",
+        'MAN: "ssdp:discover"',
+        "MX: 2",
+        "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+        "", "",
+    ]).encode()
+
+    locations = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.settimeout(0.5)
+    deadline = time.monotonic() + timeout
+    try:
+        sock.sendto(request, (_SSDP_ADDR, _SSDP_PORT))
+        while time.monotonic() < deadline:
+            try:
+                data, _addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            text = data.decode(errors="ignore")
+            m = re.search(r"^LOCATION:\s*(\S+)", text, re.IGNORECASE | re.MULTILINE)
+            if m and m.group(1) not in locations:
+                locations.append(m.group(1))
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    return locations
+
+
+def _fetch_igd_xml(location_url, timeout=3.0):
+    """Downloads and parses a UPnP device's description XML (a plain,
+    unauthenticated HTTP GET) into an ElementTree. Returns None on any
+    failure -- fetching, timing out, or malformed XML."""
+    try:
+        with urllib.request.urlopen(location_url, timeout=timeout) as resp:
+            xml_bytes = resp.read()
+        return ET.fromstring(xml_bytes)
+    except (urllib.error.URLError, OSError, ValueError, ET.ParseError):
+        return None
+
+
+def _find_igd_service(root, base_url, wanted_substrings):
+    """
+    Searches a parsed IGD description tree for the first service whose
+    serviceType contains any of `wanted_substrings` (e.g.
+    "WANIPConnection"), at any nesting depth -- IGD services are
+    typically nested a few devices deep (root -> WANDevice ->
+    WANConnectionDevice -> the actual service), and ElementTree's
+    .iter() searches all descendants regardless of depth. Returns
+    (control_url, service_type), or (None, None) if nothing matched.
+    """
+    def tag(name):
+        return f"{{{_UPNP_DEVICE_NS}}}{name}"
+
+    for service in root.iter(tag("service")):
+        service_type = service.findtext(tag("serviceType")) or ""
+        if any(w in service_type for w in wanted_substrings):
+            control = service.findtext(tag("controlURL"))
+            if control:
+                if not control.startswith("http"):
+                    control = base_url + (control if control.startswith("/") else "/" + control)
+                return control, service_type
+    return None, None
+
+
+def _soap_call(control_url, service_type, action, timeout=3.0):
+    """
+    Sends a UPnP SOAP action call (a plain HTTP POST with an XML body --
+    no auth) and returns every leaf element's text from the response,
+    keyed by tag name (e.g. {"NewExternalIPAddress": "41.x.x.x"}).
+    Returns None on any failure.
+    """
+    body = (
+        '<?xml version="1.0"?>'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        "<s:Body>"
+        f'<u:{action} xmlns:u="{service_type}"></u:{action}>'
+        "</s:Body></s:Envelope>"
+    ).encode()
+
+    req = urllib.request.Request(
+        control_url,
+        data=body,
+        headers={
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction": f'"{service_type}#{action}"',
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp_bytes = resp.read()
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+    try:
+        root = ET.fromstring(resp_bytes)
+    except ET.ParseError:
+        return None
+
+    result = {}
+    for elem in root.iter():
+        tag_name = elem.tag.split("}")[-1]
+        if elem.text and elem.text.strip() and not list(elem):
+            result[tag_name] = elem.text.strip()
+    return result
+
+
+def query_upnp_gateway(timeout=3.0):
+    """
+    Talks to the router via UPnP IGD (Internet Gateway Device) -- a real,
+    standardized protocol most consumer routers (Tenda/TP-Link included)
+    support, and one that's normally unauthenticated on the LAN by
+    design (it exists so any app can request port-forwarding without a
+    login prompt). No router credentials needed, unlike the web admin
+    panel.
+
+    This only ever covers what the standard exposes: WAN/external IP,
+    connection status, uptime, and (best-effort) traffic byte counters.
+    It does NOT get the DHCP client list or the router's actual
+    configured DHCP range -- that data only lives behind the router's
+    own web admin login, which UPnP doesn't expose. See CLAUDE.md's
+    "Flagged / open decisions" for that piece.
+
+    Known gap: the WANCommonInterfaceConfig traffic-counter lookup is
+    unverified against real hardware -- not every router implements it,
+    and a missing/failed result there is treated as "not available,"
+    not an error, since it's a bonus on top of the core WAN info.
+
+    Returns (info, errors). info is {} if no IGD was found at all.
+    """
+    errors = []
+    info = {}
+
+    locations = _ssdp_discover(timeout=timeout)
+    if not locations:
+        errors.append(
+            "No UPnP Internet Gateway Device responded to SSDP discovery "
+            "(some routers have UPnP turned off by default)"
+        )
+        return info, errors
+
+    root = None
+    base_url = None
+    for location in locations:
+        candidate_root = _fetch_igd_xml(location, timeout=timeout)
+        if candidate_root is not None:
+            parsed = urllib.parse.urlparse(location)
+            root = candidate_root
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            break
+    if root is None:
+        errors.append(f"Found {len(locations)} UPnP device(s) but couldn't fetch/parse their description XML")
+        return info, errors
+
+    control_url, service_type = _find_igd_service(root, base_url, ("WANIPConnection", "WANPPPConnection"))
+    if not control_url:
+        errors.append("No WANIPConnection/WANPPPConnection service found in the UPnP device description")
+        return info, errors
+    info["control_url"] = control_url
+    info["service_type"] = service_type
+
+    ext_ip = _soap_call(control_url, service_type, "GetExternalIPAddress", timeout=timeout)
+    if ext_ip and "NewExternalIPAddress" in ext_ip:
+        info["external_ip"] = ext_ip["NewExternalIPAddress"]
+    else:
+        errors.append("GetExternalIPAddress did not return a usable response")
+
+    status = _soap_call(control_url, service_type, "GetStatusInfo", timeout=timeout)
+    if status:
+        info["connection_status"] = status.get("NewConnectionStatus")
+        info["uptime_seconds"] = status.get("NewUptime")
+        info["last_connection_error"] = status.get("NewLastConnectionError")
+    else:
+        errors.append("GetStatusInfo did not return a usable response")
+
+    # Traffic counters live on a different service (WANCommonInterfaceConfig,
+    # a sibling of WANIPConnection) that not every router implements --
+    # best-effort, missing is normal, not an error.
+    traffic_control_url, traffic_service_type = _find_igd_service(root, base_url, ("WANCommonInterfaceConfig",))
+    if traffic_control_url:
+        sent = _soap_call(traffic_control_url, traffic_service_type, "GetTotalBytesSent", timeout=timeout)
+        received = _soap_call(traffic_control_url, traffic_service_type, "GetTotalBytesReceived", timeout=timeout)
+        if sent and "NewTotalBytesSent" in sent:
+            info["total_bytes_sent"] = sent["NewTotalBytesSent"]
+        if received and "NewTotalBytesReceived" in received:
+            info["total_bytes_received"] = received["NewTotalBytesReceived"]
+
+    return info, errors
+
+
 def get_arp_table():
     """
     Reads the OS ARP table (IP -> MAC), which reflects Layer 2 activity.
@@ -1257,7 +1491,7 @@ def suggest_best_channel(networks):
     return recommendation
 
 
-def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False):
+def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False, skip_upnp=False):
     print("Detecting local network...")
     local_ip, network_str = get_local_ip_and_subnet()
     gateway_ip = get_default_gateway()
@@ -1370,6 +1604,21 @@ def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False):
             tried = ", ".join(c["target"] for c in internet["checks"])
             print(f"  NOT reachable (tried {tried})")
 
+    upnp_gateway, upnp_errors = {}, []
+    if not skip_upnp:
+        print("\nChecking router via UPnP (no credentials needed)...")
+        upnp_gateway, upnp_errors = query_upnp_gateway()
+        for err in upnp_errors:
+            print(f"  ! {err}")
+        if upnp_gateway.get("external_ip"):
+            print(f"  External IP: {upnp_gateway['external_ip']}")
+        if upnp_gateway.get("connection_status"):
+            print(f"  Connection:  {upnp_gateway['connection_status']}"
+                  + (f" (uptime {upnp_gateway['uptime_seconds']}s)" if upnp_gateway.get("uptime_seconds") else ""))
+        if upnp_gateway.get("total_bytes_sent") or upnp_gateway.get("total_bytes_received"):
+            print(f"  Traffic:     sent={upnp_gateway.get('total_bytes_sent', '?')} "
+                  f"received={upnp_gateway.get('total_bytes_received', '?')}")
+
     return {
         "local_ip": local_ip,
         "ip_assignment_mode": ip_mode,
@@ -1389,6 +1638,8 @@ def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False):
         "wifi_scan_errors": wifi_errors,
         "channel_recommendation": channel_recommendation,
         "internet": internet,
+        "upnp_gateway": upnp_gateway,
+        "upnp_errors": upnp_errors,
     }
 
 
@@ -1401,9 +1652,14 @@ def main():
     parser.add_argument("--no-wifi", action="store_true", help="Skip Wi-Fi network scanning (faster)")
     parser.add_argument("--no-internet", action="store_true",
                          help="Skip the internet reachability check (A1's one exception to staying fully offline)")
+    parser.add_argument("--no-upnp", action="store_true",
+                         help="Skip the UPnP router query (still LAN-only, but a separate protocol/socket path)")
     args = parser.parse_args()
 
-    results = run_discovery(skip_ports=args.no_ports, skip_wifi=args.no_wifi, skip_internet=args.no_internet)
+    results = run_discovery(
+        skip_ports=args.no_ports, skip_wifi=args.no_wifi,
+        skip_internet=args.no_internet, skip_upnp=args.no_upnp,
+    )
 
     if args.json:
         payload = json.dumps(results, indent=2)

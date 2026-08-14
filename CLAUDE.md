@@ -180,10 +180,20 @@ a non-technical install target later). Current version does:
   "One narrow, deliberate exception" in the Architecture section above.
   TCP-connect test (not ICMP) to a couple of well-known IPs on port 443,
   skippable with `--no-internet`
+- Router WAN info via UPnP IGD (`query_upnp_gateway()`) — external IP,
+  connection status, uptime, and (best-effort, **not yet verified on real
+  hardware**) traffic byte counters, via SSDP discovery + SOAP calls to
+  the router's WANIPConnection/WANPPPConnection service (and
+  WANCommonInterfaceConfig for traffic, if the router implements it).
+  **No router credentials needed** — UPnP is unauthenticated on the LAN
+  by design, that's what makes this different from the web-UI-scraping
+  approach flagged below. Doesn't get the DHCP client list or the
+  router's actual configured DHCP range; UPnP doesn't expose that (see
+  Flagged decisions). Skippable with `--no-upnp`
 - JSON export (`--json`) in the shape that will eventually be handed to A6
   directly instead of a file
-- `--no-ports` / `--no-wifi` / `--no-internet` flags to skip slower or
-  internet-touching steps
+- `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` flags to
+  skip slower or internet/LAN-broadcast-touching steps
 
 Everything else (A2 through A7) is not started yet.
 
@@ -207,6 +217,20 @@ Everything else (A2 through A7) is not started yet.
   required since iOS 14, multicast/broadcast limited) and behaves
   differently on Android. Not yet decided — revisit before building
   anything that assumes a target platform.
+- **Web-UI scraping for consumer routers (Tenda/TP-Link) — flagged, not
+  built.** UPnP IGD (built, see A1's current state above) covers WAN
+  IP/connection status/traffic with zero router credentials, but it
+  doesn't expose the DHCP client list or the router's actual configured
+  DHCP range — the exact gap `calculate_pool_usage()` already flags.
+  Getting that data means logging into the router's own web admin panel
+  and calling its undocumented endpoints (`/goform/...` on Tenda,
+  `/cgi-bin/...` on TP-Link) directly — no clean API exists for either
+  brand. Those endpoints are unofficial, vary by model/region/firmware,
+  and need per-model reverse engineering (capturing what the router's
+  own admin UI does via browser dev tools) rather than one integration
+  that works everywhere. Deferred until the Credential Manager exists —
+  no point building something that needs a stored router login before
+  there's a safe place to keep one.
 
 ## Working conventions
 
