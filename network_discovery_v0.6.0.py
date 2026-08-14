@@ -3,8 +3,29 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.5.0
+VERSION: 0.6.0
 CHANGELOG:
+  0.6.0 - Three additions Claude suggested and Ammar approved:
+            - check_gateway_latency(): pings the gateway a handful of
+              times (not just once) for real signal on connection
+              quality -- packet loss and average round-trip time, not
+              just alive/dead. Deliberately separate from the one-shot
+              _ping_once() used for the subnet sweep; running 4-5 pings
+              against every host in the subnet would be far too slow, so
+              this only ever targets the single gateway IP.
+            - MTU per interface, folded into get_interface_status()'s
+              existing per-interface dict (`ip link show` / `ifconfig`
+              already report it; Windows needed a second netsh command,
+              `netsh interface ipv4 show subinterfaces`, merged in by
+              interface name).
+            - check_internet_reachability(): a lightweight TCP-connect
+              test (not ICMP) to a couple of well-known IPs on port 443.
+              This is A1's one deliberate, documented exception to "only
+              A7 touches the internet" -- see CLAUDE.md's Architecture
+              section for the reasoning. It's a reachability TEST, not a
+              dependency: nothing else in A1 needs it to succeed, and the
+              whole rest of the file still works fully offline. Skippable
+              with --no-internet.
   0.5.0 - Two more items from Ammar's list:
             - get_interface_status() now reports admin_enabled and
               connected as two separate fields instead of one collapsed
@@ -89,9 +110,10 @@ CHANGELOG:
 
 Standard-library only. No pip installs, on purpose -- see CLAUDE.md for why.
 
-Run it directly:  python3 network_discovery_v0.5.0.py
-Skip the slow steps while testing:  python3 network_discovery_v0.5.0.py --no-ports --no-wifi
-Dump machine-readable output:       python3 network_discovery_v0.5.0.py --json out.json
+Run it directly:  python3 network_discovery_v0.6.0.py
+Skip the slow steps while testing:  python3 network_discovery_v0.6.0.py --no-ports --no-wifi
+Stay fully offline, no exceptions: python3 network_discovery_v0.6.0.py --no-internet
+Dump machine-readable output:       python3 network_discovery_v0.6.0.py --json out.json
 
 Note on Wi-Fi scanning permissions: on Linux, actually triggering a scan
 (as opposed to reading a cached list) usually needs root. If you see a
@@ -106,6 +128,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 # Ports we probe on every live host, and what finding an open one suggests
@@ -153,6 +176,14 @@ NONOVERLAPPING_24GHZ = [1, 6, 11]
 # 5GHz channels that don't require DFS (radar detection) -- safe to
 # recommend without worrying about a router refusing or delaying on them.
 COMMON_5GHZ = [36, 40, 44, 48, 149, 153, 157, 161]
+
+# Used only by check_internet_reachability() -- Cloudflare and Google's
+# anycast IPs, picked purely for extremely high uptime/ubiquity as
+# reachability-check targets (this is standard practice, e.g. router
+# firmware "internet check" features use the same pattern). We do a bare
+# TCP connect to port 443 and nothing else -- no data sent beyond the
+# handshake, no DNS lookups performed against them.
+INTERNET_CHECK_TARGETS = [("1.1.1.1", 443), ("8.8.8.8", 443)]
 
 SYSTEM = platform.system()  # "Windows", "Linux", or "Darwin" (macOS)
 
@@ -398,10 +429,29 @@ def _guess_interface_type(name):
     return "other"
 
 
+def _windows_mtu_by_interface():
+    """Maps interface name -> MTU on Windows via a second, separate netsh
+    command from the one get_interface_status() uses for up/down state."""
+    mtu = {}
+    try:
+        result = subprocess.run(
+            ["netsh", "interface", "ipv4", "show", "subinterfaces"],
+            capture_output=True, text=True, errors="ignore", timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[0].isdigit():
+                    mtu[" ".join(parts[4:])] = int(parts[0])
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        pass
+    return mtu
+
+
 def get_interface_status():
     """
     Lists network interfaces with two separate signals per interface,
-    not one collapsed "up" bool:
+    not one collapsed "up" bool, plus MTU:
       - admin_enabled: was the adapter itself turned on/off (Windows
         adapter settings "Enable"/"Disable", Linux/macOS admin UP flag)
       - connected: is it actually carrying a link right now (Windows
@@ -430,15 +480,18 @@ def get_interface_status():
                 errors.append(f"netsh interface show interface failed: {(result.stderr or result.stdout).strip()}")
                 return interfaces, errors
 
+            mtu_by_name = _windows_mtu_by_interface()
             for line in result.stdout.splitlines():
                 parts = line.split(None, 3)
                 if len(parts) == 4 and parts[0] in ("Enabled", "Disabled"):
                     admin_state, conn_state, _if_type, name = parts
+                    name = name.strip()
                     interfaces.append({
-                        "name": name.strip(),
+                        "name": name,
                         "type": _guess_interface_type(name),
                         "admin_enabled": admin_state == "Enabled",
                         "connected": conn_state == "Connected",
+                        "mtu": mtu_by_name.get(name),
                     })
             if not interfaces:
                 snippet = "\n".join(result.stdout.splitlines()[:6])
@@ -464,11 +517,13 @@ def get_interface_status():
                 name, flags = m.group(1), m.group(2).split(",")
                 if name == "lo":
                     continue
+                mtu_m = re.search(r"\bmtu\s+(\d+)", line)
                 interfaces.append({
                     "name": name,
                     "type": _guess_interface_type(name),
                     "admin_enabled": "UP" in flags,
                     "connected": "LOWER_UP" in flags,
+                    "mtu": int(mtu_m.group(1)) if mtu_m else None,
                 })
             if not interfaces:
                 errors.append("ip link show ran but found no non-loopback interfaces")
@@ -492,11 +547,13 @@ def get_interface_status():
                 if name == "lo0":
                     continue
                 status_m = re.search(r"status:\s*(\w+)", block)
+                mtu_m = re.search(r"\bmtu\s+(\d+)", block)
                 interfaces.append({
                     "name": name,
                     "type": mac_types.get(name, _guess_interface_type(name)),
                     "admin_enabled": "UP" in flags,
                     "connected": (status_m.group(1) == "active") if status_m else None,
+                    "mtu": int(mtu_m.group(1)) if mtu_m else None,
                 })
             if not interfaces:
                 errors.append("ifconfig ran but found no non-loopback interfaces")
@@ -705,6 +762,77 @@ def ping_sweep(network_str, max_workers=64):
             if future.result():
                 alive.add(ip)
     return alive
+
+
+def check_gateway_latency(gateway_ip, count=4, timeout_ms=1000):
+    """
+    Pings the gateway a handful of times -- not just once -- for real
+    signal on connection quality: packet loss and average round-trip
+    time, not just alive/dead. Deliberately separate from the one-shot
+    _ping_once() the subnet sweep uses; running several pings against
+    every host in the subnet would be far too slow, so this only ever
+    targets the single gateway IP.
+    """
+    if not gateway_ip:
+        return {"target": None, "sent": 0, "received": 0, "loss_percent": None, "avg_ms": None}
+
+    rtts = []
+    received = 0
+    for _ in range(count):
+        if SYSTEM == "Windows":
+            cmd = ["ping", "-n", "1", "-w", str(timeout_ms), gateway_ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(max(1, timeout_ms // 1000)), gateway_ip]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_ms / 1000 + 2)
+        except (subprocess.SubprocessError, OSError):
+            continue
+        if result.returncode == 0:
+            received += 1
+            m = re.search(r"time[=<]\s*([\d.]+)\s*ms", result.stdout, re.IGNORECASE)
+            if m:
+                rtts.append(float(m.group(1)))
+
+    return {
+        "target": gateway_ip,
+        "sent": count,
+        "received": received,
+        "loss_percent": round((count - received) / count * 100, 1) if count else None,
+        "avg_ms": round(sum(rtts) / len(rtts), 1) if rtts else None,
+    }
+
+
+def check_internet_reachability(targets=INTERNET_CHECK_TARGETS, timeout=2.0):
+    """
+    A1's one deliberate exception to "only A7 touches the internet" (see
+    CLAUDE.md's Architecture section) -- a lightweight reachability TEST,
+    not a dependency. Nothing else in this file needs this to succeed;
+    everything else works fully offline. This exists because the
+    product's whole vision is diagnosing network issues *including* when
+    the internet connection itself is the problem, which needs an actual
+    check of whether the WAN path is up.
+
+    Uses a plain TCP connect (not ICMP) to a couple of well-known IPs on
+    port 443 -- no admin/root needed, and it reflects real usage (a
+    browser doing HTTPS) better than a ping would. Skippable with
+    --no-internet.
+    """
+    checks = []
+    reachable = False
+    for ip, port in targets:
+        start = time.monotonic()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect((ip, port))
+            elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+            checks.append({"target": f"{ip}:{port}", "reachable": True, "latency_ms": elapsed_ms})
+            reachable = True
+        except OSError:
+            checks.append({"target": f"{ip}:{port}", "reachable": False, "latency_ms": None})
+        finally:
+            s.close()
+    return {"reachable": reachable, "checks": checks}
 
 
 def get_arp_table():
@@ -1129,7 +1257,7 @@ def suggest_best_channel(networks):
     return recommendation
 
 
-def run_discovery(skip_ports=False, skip_wifi=False):
+def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False):
     print("Detecting local network...")
     local_ip, network_str = get_local_ip_and_subnet()
     gateway_ip = get_default_gateway()
@@ -1142,6 +1270,11 @@ def run_discovery(skip_ports=False, skip_wifi=False):
     for err in dns_errors + ip_mode_errors:
         print(f"  ! {err}")
 
+    gateway_latency = check_gateway_latency(gateway_ip)
+    if gateway_latency["target"]:
+        print(f"  Gateway latency: {gateway_latency['received']}/{gateway_latency['sent']} replies, "
+              f"{gateway_latency['loss_percent']}% loss, avg {gateway_latency['avg_ms']}ms")
+
     print("\nChecking network interfaces...")
     interfaces, iface_errors = get_interface_status()
     for err in iface_errors:
@@ -1152,7 +1285,8 @@ def run_discovery(skip_ports=False, skip_wifi=False):
             conn = "connected: unknown"
         else:
             conn = "connected" if iface["connected"] else "not connected"
-        print(f"  {iface['name']:<12} type={iface['type']:<9} {admin:<10} {conn}")
+        mtu = f"mtu={iface['mtu']}" if iface["mtu"] else "mtu=?"
+        print(f"  {iface['name']:<12} type={iface['type']:<9} {admin:<10} {conn:<16} {mtu}")
 
     wifi_radio, wifi_radio_errors = get_wifi_radio_state()
     if wifi_radio["hardware"] or wifi_radio["software"]:
@@ -1225,12 +1359,24 @@ def run_discovery(skip_ports=False, skip_wifi=False):
         elif not wifi_errors:
             print("  No Wi-Fi networks found.")
 
+    internet = {"reachable": None, "checks": []}
+    if not skip_internet:
+        print("\nChecking internet reachability...")
+        internet = check_internet_reachability()
+        if internet["reachable"]:
+            ok = next(c for c in internet["checks"] if c["reachable"])
+            print(f"  Reachable ({ok['target']} in {ok['latency_ms']}ms)")
+        else:
+            tried = ", ".join(c["target"] for c in internet["checks"])
+            print(f"  NOT reachable (tried {tried})")
+
     return {
         "local_ip": local_ip,
         "ip_assignment_mode": ip_mode,
         "ip_assignment_errors": ip_mode_errors,
         "subnet": network_str,
         "gateway": gateway_ip,
+        "gateway_latency": gateway_latency,
         "dns_servers": dns_servers,
         "dns_scan_errors": dns_errors,
         "interfaces": interfaces,
@@ -1242,6 +1388,7 @@ def run_discovery(skip_ports=False, skip_wifi=False):
         "wifi_networks": wifi_networks,
         "wifi_scan_errors": wifi_errors,
         "channel_recommendation": channel_recommendation,
+        "internet": internet,
     }
 
 
@@ -1252,9 +1399,11 @@ def main():
                               "or omit the path to print JSON to stdout.")
     parser.add_argument("--no-ports", action="store_true", help="Skip port probing (faster)")
     parser.add_argument("--no-wifi", action="store_true", help="Skip Wi-Fi network scanning (faster)")
+    parser.add_argument("--no-internet", action="store_true",
+                         help="Skip the internet reachability check (A1's one exception to staying fully offline)")
     args = parser.parse_args()
 
-    results = run_discovery(skip_ports=args.no_ports, skip_wifi=args.no_wifi)
+    results = run_discovery(skip_ports=args.no_ports, skip_wifi=args.no_wifi, skip_internet=args.no_internet)
 
     if args.json:
         payload = json.dumps(results, indent=2)

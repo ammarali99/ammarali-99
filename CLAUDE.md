@@ -70,6 +70,17 @@ internet, and only opportunistically. Nothing else is allowed to make an
 outbound call — that's not a style preference, it's the core offline-first
 constraint.
 
+**One narrow, deliberate exception:** A1's `check_internet_reachability()`
+does a lightweight TCP-connect reachability *test* (not ICMP, no data sent
+beyond the handshake) to a couple of well-known IPs on port 443 — a
+diagnostic check, not a dependency. A1 doesn't need it to succeed for
+anything else it does, and it's skippable with `--no-internet`. This exists
+because the product's whole vision is diagnosing network issues *including*
+when the internet connection itself is the problem, which needs an actual
+check of whether the WAN path is up — that requires this one call, so it's
+a decided carve-out rather than an unnoticed rule break. No other module
+gets this exception.
+
 **Credential Manager** lives locally inside the Core Engine (not the cloud) —
 device/router login credentials, encrypted at rest, never leave the device.
 Feeds A3 so fixes on managed devices still work during an outage.
@@ -159,9 +170,20 @@ a non-technical install target later). Current version does:
   also flags it when the command *succeeds* but nothing matches the
   expected output format, since that's a second, quieter way to end up
   with an empty result that isn't an exception at all
+- Gateway latency check (`check_gateway_latency()`) — several pings
+  against just the gateway (not the whole subnet, too slow), reporting
+  packet loss % and average round-trip time instead of a single-ping
+  alive/dead
+- MTU per interface, folded into `get_interface_status()`'s existing
+  per-interface data
+- Internet reachability check (`check_internet_reachability()`) — see
+  "One narrow, deliberate exception" in the Architecture section above.
+  TCP-connect test (not ICMP) to a couple of well-known IPs on port 443,
+  skippable with `--no-internet`
 - JSON export (`--json`) in the shape that will eventually be handed to A6
   directly instead of a file
-- `--no-ports` / `--no-wifi` flags to skip slower steps
+- `--no-ports` / `--no-wifi` / `--no-internet` flags to skip slower or
+  internet-touching steps
 
 Everything else (A2 through A7) is not started yet.
 
