@@ -121,11 +121,45 @@ a non-technical install target later). Current version does:
   network the scan found and recommends the least congested 2.4GHz
   channel (only ever from 1/6/11, the non-overlapping set) and 5GHz
   channel
+- DNS server detection (offline — reads local config/OS state, doesn't
+  query DNS itself)
+- IP pool usage (`calculate_pool_usage()`) — used/free/percent across the
+  *scanned subnet*. **Known gap:** not the router's actual configured
+  DHCP range, which we can't know without asking the router directly
+- Network interface status (`get_interface_status()`) — up/down + a
+  best-effort ethernet/wifi guess per interface (exact on macOS via a
+  hardware-port lookup, name-based guess elsewhere — **known gap** on
+  Windows/Linux if a machine uses non-obvious interface naming)
+- Static-vs-DHCP detection (`get_ip_assignment_mode()`). **Known gap:**
+  Linux detection needs NetworkManager (`nmcli`) managing the interface;
+  returns `"unknown"` rather than guessing wrong if it's not present
+  (e.g. servers using netplan/systemd-networkd directly)
 - JSON export (`--json`) in the shape that will eventually be handed to A6
   directly instead of a file
 - `--no-ports` / `--no-wifi` flags to skip slower steps
 
 Everything else (A2 through A7) is not started yet.
+
+## Flagged / open decisions
+
+- **CDP and LLDP discovery — flagged, not built.** Both need raw Layer-2
+  packet capture (passively listening for frames switches broadcast),
+  which needs root/admin on every desktop OS, and has **no viable path at
+  all on iOS** (Apple's app sandbox blocks raw sockets structurally — no
+  permission can unlock it short of jailbreaking) or on a **non-rooted
+  Android** phone (blocked by SELinux policy since roughly Android 8/9).
+  Adding a dependency like `scapy` would make the Windows/Linux/macOS code
+  easier to write, but doesn't remove either constraint — the root/admin
+  requirement and the mobile-OS block are both below what any Python
+  library can reach.
+- **Open question this raises: is iOS/Android a target platform for this
+  app at all?** Nothing in A1 today assumes mobile — `netsh`/`ip`/
+  `ifconfig` are all desktop-native tools. If mobile ends up in scope,
+  it's a bigger conversation than just CDP/LLDP: even basic local network
+  scanning is restricted on iOS (explicit "Local Network" permission
+  required since iOS 14, multicast/broadcast limited) and behaves
+  differently on Android. Not yet decided — revisit before building
+  anything that assumes a target platform.
 
 ## Working conventions
 

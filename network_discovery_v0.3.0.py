@@ -3,8 +3,29 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.2.0
+VERSION: 0.3.0
 CHANGELOG:
+  0.3.0 - Added five discovery items from Ammar's list:
+            - get_dns_servers(): configured DNS server(s), offline (reads
+              local config, doesn't query DNS itself)
+            - calculate_pool_usage(): rough IP pool usage for the scanned
+              subnet (used/free/percent) -- known gap, see docstring: this
+              is usage across the whole subnet, not the router's actual
+              configured DHCP range, which we have no way to know without
+              asking the router
+            - get_interface_status(): which network interfaces exist and
+              whether each is up or down, with a best-effort ethernet/wifi
+              guess (exact on macOS via hardware-port lookup, name-based
+              guess elsewhere)
+            - get_ip_assignment_mode(): whether this machine's IP looks
+              like DHCP or static -- known gap: Linux detection needs
+              NetworkManager (nmcli); returns "unknown" rather than
+              guessing wrong if it's not present
+            - get_arp_table() was already built (v0.1.0)
+          CDP and LLDP (from the same list) are deliberately NOT here --
+          see CLAUDE.md's "Flagged / open decisions" section for why
+          (raw Layer-2 capture needs root/admin everywhere, and has no
+          viable path at all on iOS, or on a non-rooted Android phone).
   0.2.0 - Wi-Fi scanning was silently failing: every error inside
           scan_wifi_networks() was caught and swallowed with `pass`, so a
           failed scan looked identical to "zero networks found" -- you'd
@@ -27,9 +48,9 @@ CHANGELOG:
 
 Standard-library only. No pip installs, on purpose -- see CLAUDE.md for why.
 
-Run it directly:  python3 network_discovery_v0.2.0.py
-Skip the slow steps while testing:  python3 network_discovery_v0.2.0.py --no-ports --no-wifi
-Dump machine-readable output:       python3 network_discovery_v0.2.0.py --json out.json
+Run it directly:  python3 network_discovery_v0.3.0.py
+Skip the slow steps while testing:  python3 network_discovery_v0.3.0.py --no-ports --no-wifi
+Dump machine-readable output:       python3 network_discovery_v0.3.0.py --json out.json
 
 Note on Wi-Fi scanning permissions: on Linux, actually triggering a scan
 (as opposed to reading a cached list) usually needs root. If you see a
@@ -155,6 +176,31 @@ def _get_netmask_for_ip(ip):
     return "24"
 
 
+def _get_interface_for_ip(ip):
+    """Finds which network interface has this IP assigned. Used by
+    get_ip_assignment_mode() to know which connection/interface to ask
+    about. Returns None if not found (e.g. on Windows, which looks up
+    DHCP status by IP directly instead and doesn't need this)."""
+    try:
+        if SYSTEM == "Linux":
+            out = subprocess.check_output(["ip", "-o", "-f", "inet", "addr", "show"], text=True)
+            for line in out.splitlines():
+                if ip in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return parts[1]
+        elif SYSTEM == "Darwin":
+            out = subprocess.check_output(["ifconfig"], text=True)
+            for block in out.split("\n\n"):
+                if ip in block:
+                    m = re.match(r"^(\w+):", block)
+                    if m:
+                        return m.group(1)
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        pass
+    return None
+
+
 def get_default_gateway():
     """Returns the default gateway IP as a string, or None if not found."""
     try:
@@ -173,6 +219,222 @@ def get_default_gateway():
     except (subprocess.SubprocessError, OSError, FileNotFoundError):
         pass
     return None
+
+
+def get_dns_servers():
+    """
+    Finds the DNS server(s) this machine is configured to use. Fully
+    offline -- reads local config/OS state, never queries a DNS server
+    itself.
+    """
+    servers = []
+    try:
+        if SYSTEM == "Windows":
+            out = subprocess.check_output(["ipconfig", "/all"], text=True, errors="ignore")
+            in_dns_block = False
+            for line in out.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("DNS Servers"):
+                    m = re.search(r":\s*([\d.]+)\s*$", stripped)
+                    if m:
+                        servers.append(m.group(1))
+                    in_dns_block = True
+                    continue
+                if in_dns_block and re.match(r"^\d{1,3}(\.\d{1,3}){3}$", stripped):
+                    servers.append(stripped)
+                    continue
+                in_dns_block = False
+        else:
+            # Linux and macOS both maintain /etc/resolv.conf.
+            try:
+                with open("/etc/resolv.conf") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("nameserver"):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                servers.append(parts[1])
+            except FileNotFoundError:
+                pass
+            if not servers and SYSTEM == "Darwin":
+                out = subprocess.check_output(["scutil", "--dns"], text=True, errors="ignore")
+                for line in out.splitlines():
+                    m = re.search(r"nameserver\[\d+\]\s*:\s*([\d.]+)", line)
+                    if m:
+                        servers.append(m.group(1))
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        pass
+
+    seen = set()
+    unique = []
+    for s in servers:
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    return unique
+
+
+def calculate_pool_usage(network_str, device_count):
+    """
+    Rough IP pool usage for the subnet we scanned: how many addresses are
+    in use out of how many are usable.
+
+    Known gap: this is usage across the *whole subnet*, not the router's
+    actual configured DHCP range -- a router might only hand out
+    .100-.200 while the subnet is a full /24. We have no way to know the
+    real DHCP range without asking the router directly (that's an A3-era
+    problem, once we have router credentials/access).
+    """
+    network = ipaddress.ip_network(network_str, strict=False)
+    total_usable = max(network.num_addresses - 2, 1)
+    used = min(device_count, total_usable)
+    return {
+        "subnet": str(network),
+        "total_usable": total_usable,
+        "used": used,
+        "free": total_usable - used,
+        "percent_used": round(used / total_usable * 100, 1),
+    }
+
+
+def _macos_interface_types():
+    """Maps macOS interface names (en0, en1, ...) to wifi/ethernet using
+    the hardware-port list, since macOS names alone don't tell you which
+    is which (en0 is Wi-Fi on some Macs, Ethernet on others)."""
+    types = {}
+    try:
+        out = subprocess.check_output(["networksetup", "-listallhardwareports"], text=True)
+        for block in out.split("\n\n"):
+            port_m = re.search(r"Hardware Port: (.+)", block)
+            dev_m = re.search(r"Device: (\w+)", block)
+            if port_m and dev_m:
+                if "Wi-Fi" in port_m.group(1) or "AirPort" in port_m.group(1):
+                    types[dev_m.group(1)] = "wifi"
+                elif "Ethernet" in port_m.group(1):
+                    types[dev_m.group(1)] = "ethernet"
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        pass
+    return types
+
+
+def _guess_interface_type(name):
+    """Best-effort ethernet/wifi guess from interface naming conventions.
+    Known gap: unreliable on macOS by name alone -- get_interface_status()
+    uses _macos_interface_types() instead there."""
+    lname = name.lower()
+    if "wi-fi" in lname or "wifi" in lname or "wlan" in lname or lname.startswith("wl"):
+        return "wifi"
+    if "ethernet" in lname or lname.startswith("eth") or lname.startswith("en"):
+        return "ethernet"
+    return "other"
+
+
+def get_interface_status():
+    """
+    Lists network interfaces and whether each is up or down, with a
+    best-effort ethernet/wifi guess per interface.
+    """
+    interfaces = []
+    try:
+        if SYSTEM == "Windows":
+            out = subprocess.check_output(["netsh", "interface", "show", "interface"], text=True, errors="ignore")
+            for line in out.splitlines():
+                parts = line.split(None, 3)
+                if len(parts) == 4 and parts[0] in ("Enabled", "Disabled"):
+                    admin_state, state, _if_type, name = parts
+                    interfaces.append({
+                        "name": name.strip(),
+                        "type": _guess_interface_type(name),
+                        "up": admin_state == "Enabled" and state == "Connected",
+                    })
+        elif SYSTEM == "Linux":
+            out = subprocess.check_output(["ip", "-o", "link", "show"], text=True)
+            for line in out.splitlines():
+                m = re.match(r"\d+:\s+([^:@]+)[:@].*?<([^>]*)>", line)
+                if not m:
+                    continue
+                name, flags = m.group(1), m.group(2).split(",")
+                if name == "lo":
+                    continue
+                interfaces.append({
+                    "name": name,
+                    "type": _guess_interface_type(name),
+                    "up": "UP" in flags,
+                })
+        elif SYSTEM == "Darwin":
+            mac_types = _macos_interface_types()
+            out = subprocess.check_output(["ifconfig"], text=True)
+            for block in out.split("\n\n"):
+                m = re.match(r"^(\w+):\s*flags=\d+<([^>]*)>", block)
+                if not m:
+                    continue
+                name, flags = m.group(1), m.group(2).split(",")
+                if name == "lo0":
+                    continue
+                interfaces.append({
+                    "name": name,
+                    "type": mac_types.get(name, _guess_interface_type(name)),
+                    "up": "UP" in flags,
+                })
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        pass
+    return interfaces
+
+
+def get_ip_assignment_mode(local_ip):
+    """
+    Best-effort check for whether this machine's IP came from DHCP or was
+    set statically.
+
+    Known gap: Linux detection depends on NetworkManager (nmcli) managing
+    the interface -- returns "unknown" rather than guessing wrong if
+    nmcli isn't present or the interface isn't NetworkManager-managed
+    (common on servers using netplan/systemd-networkd directly).
+    """
+    try:
+        if SYSTEM == "Windows":
+            out = subprocess.check_output(["ipconfig", "/all"], text=True, errors="ignore")
+            blocks = out.split("\r\n\r\n")
+            for block in blocks:
+                if local_ip in block:
+                    m = re.search(r"DHCP Enabled[.\s]*:\s*(Yes|No)", block)
+                    if m:
+                        return "dhcp" if m.group(1) == "Yes" else "static"
+
+        elif SYSTEM == "Linux":
+            iface = _get_interface_for_ip(local_ip)
+            if iface:
+                active = subprocess.check_output(
+                    ["nmcli", "-t", "-f", "NAME,DEVICE", "con", "show", "--active"],
+                    text=True, errors="ignore",
+                )
+                for line in active.splitlines():
+                    parts = line.split(":")
+                    if len(parts) == 2 and parts[1] == iface:
+                        method_out = subprocess.check_output(
+                            ["nmcli", "-t", "-f", "ipv4.method", "con", "show", parts[0]],
+                            text=True, errors="ignore",
+                        )
+                        method = method_out.strip().split(":")[-1]
+                        if method == "auto":
+                            return "dhcp"
+                        if method == "manual":
+                            return "static"
+                        break
+
+        elif SYSTEM == "Darwin":
+            iface = _get_interface_for_ip(local_ip)
+            if iface:
+                out = subprocess.run(
+                    ["ipconfig", "getpacket", iface],
+                    capture_output=True, text=True, errors="ignore", timeout=5,
+                )
+                if out.returncode == 0 and out.stdout.strip():
+                    return "dhcp"
+                return "static"
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        pass
+    return "unknown"
 
 
 def _ping_once(ip, timeout_ms=1000):
@@ -627,9 +889,18 @@ def run_discovery(skip_ports=False, skip_wifi=False):
     print("Detecting local network...")
     local_ip, network_str = get_local_ip_and_subnet()
     gateway_ip = get_default_gateway()
-    print(f"  Local IP: {local_ip}")
+    dns_servers = get_dns_servers()
+    ip_mode = get_ip_assignment_mode(local_ip)
+    print(f"  Local IP: {local_ip} ({ip_mode})")
     print(f"  Subnet:   {network_str}")
     print(f"  Gateway:  {gateway_ip or 'not found'}")
+    print(f"  DNS:      {', '.join(dns_servers) if dns_servers else 'not found'}")
+
+    print("\nChecking network interfaces...")
+    interfaces = get_interface_status()
+    for iface in interfaces:
+        state = "up" if iface["up"] else "DOWN"
+        print(f"  {iface['name']:<12} type={iface['type']:<9} {state}")
 
     print("\nPinging subnet (this can take a bit)...")
     alive = ping_sweep(network_str)
@@ -666,6 +937,11 @@ def run_discovery(skip_ports=False, skip_wifi=False):
         print(f"  {ip:<15} mac={mac or 'unknown':<17} vendor={vendor:<20} "
               f"hostname={hostname or '-':<20} role={role}")
 
+    pool_usage = calculate_pool_usage(network_str, len(all_ips))
+    print(f"\nIP pool usage: {pool_usage['used']}/{pool_usage['total_usable']} "
+          f"({pool_usage['percent_used']}%) -- across the scanned subnet, "
+          f"not necessarily the router's actual DHCP range")
+
     wifi_networks, wifi_errors = [], []
     channel_recommendation = {}
     if not skip_wifi:
@@ -689,8 +965,12 @@ def run_discovery(skip_ports=False, skip_wifi=False):
 
     return {
         "local_ip": local_ip,
+        "ip_assignment_mode": ip_mode,
         "subnet": network_str,
         "gateway": gateway_ip,
+        "dns_servers": dns_servers,
+        "interfaces": interfaces,
+        "pool_usage": pool_usage,
         "devices": devices,
         "wifi_networks": wifi_networks,
         "wifi_scan_errors": wifi_errors,
