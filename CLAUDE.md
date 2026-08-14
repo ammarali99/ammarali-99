@@ -134,6 +134,14 @@ a non-technical install target later). Current version does:
   Linux detection needs NetworkManager (`nmcli`) managing the interface;
   returns `"unknown"` rather than guessing wrong if it's not present
   (e.g. servers using netplan/systemd-networkd directly)
+- DNS/interface-status/DHCP-mode detection all now report the actual
+  error instead of failing silently, same fix as the Wi-Fi scan got in
+  v0.2.0 — `get_interface_status()` came back completely empty on
+  Ammar's real Windows machine with zero explanation (same silent-
+  failure shape, caught by testing on real hardware again). Each one
+  also flags it when the command *succeeds* but nothing matches the
+  expected output format, since that's a second, quieter way to end up
+  with an empty result that isn't an exception at all
 - JSON export (`--json`) in the shape that will eventually be handed to A6
   directly instead of a file
 - `--no-ports` / `--no-wifi` flags to skip slower steps

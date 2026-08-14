@@ -3,8 +3,29 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.3.0
+VERSION: 0.4.0
 CHANGELOG:
+  0.4.0 - Fixed the same silent-failure bug from v0.2.0, this time in the
+          v0.3.0 additions: Ammar tested on real Windows hardware and
+          get_interface_status() came back completely empty (no Ethernet,
+          no Wi-Fi, nothing) with zero explanation. Root cause was the
+          same pattern -- exceptions caught and swallowed with `pass`, so
+          a command failure looked identical to "no interfaces found."
+          get_dns_servers(), get_interface_status(), and
+          get_ip_assignment_mode() now all return (result, errors) same
+          as scan_wifi_networks(), and each one also flags it when the
+          command *succeeds* but nothing matches the expected output
+          format (including a short raw-output snippet), since that's a
+          second, quieter way to end up with an empty list that isn't an
+          exception at all.
+          Also: the Wi-Fi scan error Ammar hit --
+          "The wireless local area network interface is powered down and
+          doesn't support the requested operation" -- is netsh's real
+          answer, not a bug, but it reads like an error dump, not a
+          diagnosis. Added a plain-language hint underneath it, and
+          get_interface_status() now reports the same "Wi-Fi: DOWN"
+          finding directly, so it doesn't only show up buried in a scan
+          error.
   0.3.0 - Added five discovery items from Ammar's list:
             - get_dns_servers(): configured DNS server(s), offline (reads
               local config, doesn't query DNS itself)
@@ -48,9 +69,9 @@ CHANGELOG:
 
 Standard-library only. No pip installs, on purpose -- see CLAUDE.md for why.
 
-Run it directly:  python3 network_discovery_v0.3.0.py
-Skip the slow steps while testing:  python3 network_discovery_v0.3.0.py --no-ports --no-wifi
-Dump machine-readable output:       python3 network_discovery_v0.3.0.py --json out.json
+Run it directly:  python3 network_discovery_v0.4.0.py
+Skip the slow steps while testing:  python3 network_discovery_v0.4.0.py --no-ports --no-wifi
+Dump machine-readable output:       python3 network_discovery_v0.4.0.py --json out.json
 
 Note on Wi-Fi scanning permissions: on Linux, actually triggering a scan
 (as opposed to reading a cached list) usually needs root. If you see a
@@ -226,13 +247,26 @@ def get_dns_servers():
     Finds the DNS server(s) this machine is configured to use. Fully
     offline -- reads local config/OS state, never queries a DNS server
     itself.
+
+    Returns (servers, errors). Every failure -- including the command
+    succeeding but nothing matching the format we expect -- is reported
+    instead of silently coming back as an empty list.
     """
     servers = []
+    errors = []
     try:
         if SYSTEM == "Windows":
-            out = subprocess.check_output(["ipconfig", "/all"], text=True, errors="ignore")
+            try:
+                result = subprocess.run(["ipconfig", "/all"], capture_output=True, text=True, errors="ignore", timeout=10)
+            except FileNotFoundError:
+                errors.append("ipconfig not found (unexpected on Windows)")
+                return servers, errors
+            if result.returncode != 0:
+                errors.append(f"ipconfig /all failed: {(result.stderr or result.stdout).strip()}")
+                return servers, errors
+
             in_dns_block = False
-            for line in out.splitlines():
+            for line in result.stdout.splitlines():
                 stripped = line.strip()
                 if stripped.startswith("DNS Servers"):
                     m = re.search(r":\s*([\d.]+)\s*$", stripped)
@@ -244,6 +278,10 @@ def get_dns_servers():
                     servers.append(stripped)
                     continue
                 in_dns_block = False
+
+            if not servers:
+                errors.append("ipconfig /all ran but no \"DNS Servers\" line was found for any adapter")
+
         else:
             # Linux and macOS both maintain /etc/resolv.conf.
             try:
@@ -255,15 +293,26 @@ def get_dns_servers():
                             if len(parts) >= 2:
                                 servers.append(parts[1])
             except FileNotFoundError:
-                pass
+                errors.append("/etc/resolv.conf not found")
+
             if not servers and SYSTEM == "Darwin":
-                out = subprocess.check_output(["scutil", "--dns"], text=True, errors="ignore")
-                for line in out.splitlines():
-                    m = re.search(r"nameserver\[\d+\]\s*:\s*([\d.]+)", line)
-                    if m:
-                        servers.append(m.group(1))
-    except (subprocess.SubprocessError, OSError, FileNotFoundError):
-        pass
+                try:
+                    result = subprocess.run(["scutil", "--dns"], capture_output=True, text=True, errors="ignore", timeout=10)
+                except FileNotFoundError:
+                    errors.append("scutil not found")
+                    result = None
+                if result is not None:
+                    if result.returncode != 0:
+                        errors.append(f"scutil --dns failed: {(result.stderr or result.stdout).strip()}")
+                    else:
+                        for line in result.stdout.splitlines():
+                            m = re.search(r"nameserver\[\d+\]\s*:\s*([\d.]+)", line)
+                            if m:
+                                servers.append(m.group(1))
+                        if not servers:
+                            errors.append("scutil --dns ran but no nameserver entries were found")
+    except Exception as e:
+        errors.append(f"unexpected error finding DNS servers: {e}")
 
     seen = set()
     unique = []
@@ -271,7 +320,7 @@ def get_dns_servers():
         if s not in seen:
             seen.add(s)
             unique.append(s)
-    return unique
+    return unique, errors
 
 
 def calculate_pool_usage(network_str, device_count):
@@ -333,12 +382,27 @@ def get_interface_status():
     """
     Lists network interfaces and whether each is up or down, with a
     best-effort ethernet/wifi guess per interface.
+
+    Returns (interfaces, errors) -- same pattern as scan_wifi_networks().
+    An earlier version of this function had the exact silent-failure bug
+    that v0.2.0 fixed for Wi-Fi scanning, just not fixed here yet: caught
+    on Ammar's real Windows machine, where it came back completely empty
+    with no explanation at all.
     """
     interfaces = []
+    errors = []
     try:
         if SYSTEM == "Windows":
-            out = subprocess.check_output(["netsh", "interface", "show", "interface"], text=True, errors="ignore")
-            for line in out.splitlines():
+            try:
+                result = subprocess.run(["netsh", "interface", "show", "interface"], capture_output=True, text=True, errors="ignore", timeout=10)
+            except FileNotFoundError:
+                errors.append("netsh not found (unexpected on Windows)")
+                return interfaces, errors
+            if result.returncode != 0:
+                errors.append(f"netsh interface show interface failed: {(result.stderr or result.stdout).strip()}")
+                return interfaces, errors
+
+            for line in result.stdout.splitlines():
                 parts = line.split(None, 3)
                 if len(parts) == 4 and parts[0] in ("Enabled", "Disabled"):
                     admin_state, state, _if_type, name = parts
@@ -347,9 +411,24 @@ def get_interface_status():
                         "type": _guess_interface_type(name),
                         "up": admin_state == "Enabled" and state == "Connected",
                     })
+            if not interfaces:
+                snippet = "\n".join(result.stdout.splitlines()[:6])
+                errors.append(
+                    "netsh ran but no interface rows were recognized -- output may not "
+                    f"match the expected format. First lines:\n{snippet}"
+                )
+
         elif SYSTEM == "Linux":
-            out = subprocess.check_output(["ip", "-o", "link", "show"], text=True)
-            for line in out.splitlines():
+            try:
+                result = subprocess.run(["ip", "-o", "link", "show"], capture_output=True, text=True, timeout=10)
+            except FileNotFoundError:
+                errors.append("`ip` command not found")
+                return interfaces, errors
+            if result.returncode != 0:
+                errors.append(f"ip link show failed: {(result.stderr or result.stdout).strip()}")
+                return interfaces, errors
+
+            for line in result.stdout.splitlines():
                 m = re.match(r"\d+:\s+([^:@]+)[:@].*?<([^>]*)>", line)
                 if not m:
                     continue
@@ -361,10 +440,21 @@ def get_interface_status():
                     "type": _guess_interface_type(name),
                     "up": "UP" in flags,
                 })
+            if not interfaces:
+                errors.append("ip link show ran but found no non-loopback interfaces")
+
         elif SYSTEM == "Darwin":
             mac_types = _macos_interface_types()
-            out = subprocess.check_output(["ifconfig"], text=True)
-            for block in out.split("\n\n"):
+            try:
+                result = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=10)
+            except FileNotFoundError:
+                errors.append("ifconfig not found")
+                return interfaces, errors
+            if result.returncode != 0:
+                errors.append(f"ifconfig failed: {(result.stderr or result.stdout).strip()}")
+                return interfaces, errors
+
+            for block in result.stdout.split("\n\n"):
                 m = re.match(r"^(\w+):\s*flags=\d+<([^>]*)>", block)
                 if not m:
                     continue
@@ -376,9 +466,12 @@ def get_interface_status():
                     "type": mac_types.get(name, _guess_interface_type(name)),
                     "up": "UP" in flags,
                 })
-    except (subprocess.SubprocessError, OSError, FileNotFoundError):
-        pass
-    return interfaces
+            if not interfaces:
+                errors.append("ifconfig ran but found no non-loopback interfaces")
+    except Exception as e:
+        errors.append(f"unexpected error checking interfaces: {e}")
+
+    return interfaces, errors
 
 
 def get_ip_assignment_mode(local_ip):
@@ -390,51 +483,80 @@ def get_ip_assignment_mode(local_ip):
     the interface -- returns "unknown" rather than guessing wrong if
     nmcli isn't present or the interface isn't NetworkManager-managed
     (common on servers using netplan/systemd-networkd directly).
+
+    Returns (mode, errors) -- mode is "dhcp" / "static" / "unknown".
     """
+    errors = []
     try:
         if SYSTEM == "Windows":
-            out = subprocess.check_output(["ipconfig", "/all"], text=True, errors="ignore")
-            blocks = out.split("\r\n\r\n")
-            for block in blocks:
+            try:
+                result = subprocess.run(["ipconfig", "/all"], capture_output=True, text=True, errors="ignore", timeout=10)
+            except FileNotFoundError:
+                errors.append("ipconfig not found (unexpected on Windows)")
+                return "unknown", errors
+            if result.returncode != 0:
+                errors.append(f"ipconfig /all failed: {(result.stderr or result.stdout).strip()}")
+                return "unknown", errors
+
+            for block in result.stdout.split("\r\n\r\n"):
                 if local_ip in block:
                     m = re.search(r"DHCP Enabled[.\s]*:\s*(Yes|No)", block)
                     if m:
-                        return "dhcp" if m.group(1) == "Yes" else "static"
+                        return ("dhcp" if m.group(1) == "Yes" else "static"), errors
+            errors.append(f"ipconfig /all ran but no adapter block contained {local_ip}")
 
         elif SYSTEM == "Linux":
             iface = _get_interface_for_ip(local_ip)
-            if iface:
-                active = subprocess.check_output(
+            if not iface:
+                errors.append(f"could not find a network interface for {local_ip}")
+                return "unknown", errors
+            try:
+                active = subprocess.run(
                     ["nmcli", "-t", "-f", "NAME,DEVICE", "con", "show", "--active"],
-                    text=True, errors="ignore",
+                    capture_output=True, text=True, errors="ignore", timeout=10,
                 )
-                for line in active.splitlines():
-                    parts = line.split(":")
-                    if len(parts) == 2 and parts[1] == iface:
-                        method_out = subprocess.check_output(
-                            ["nmcli", "-t", "-f", "ipv4.method", "con", "show", parts[0]],
-                            text=True, errors="ignore",
-                        )
-                        method = method_out.strip().split(":")[-1]
-                        if method == "auto":
-                            return "dhcp"
-                        if method == "manual":
-                            return "static"
-                        break
+            except FileNotFoundError:
+                errors.append("nmcli not installed")
+                return "unknown", errors
+            if active.returncode != 0:
+                errors.append(f"nmcli con show failed: {(active.stderr or active.stdout).strip()}")
+                return "unknown", errors
+
+            found_conn = False
+            for line in active.stdout.splitlines():
+                parts = line.split(":")
+                if len(parts) == 2 and parts[1] == iface:
+                    found_conn = True
+                    method_out = subprocess.run(
+                        ["nmcli", "-t", "-f", "ipv4.method", "con", "show", parts[0]],
+                        capture_output=True, text=True, errors="ignore", timeout=10,
+                    )
+                    method = method_out.stdout.strip().split(":")[-1]
+                    if method == "auto":
+                        return "dhcp", errors
+                    if method == "manual":
+                        return "static", errors
+                    errors.append(f"nmcli reported ipv4.method={method!r} for {iface}, not auto/manual")
+                    break
+            if not found_conn:
+                errors.append(f"no active nmcli connection found for interface {iface}")
 
         elif SYSTEM == "Darwin":
             iface = _get_interface_for_ip(local_ip)
-            if iface:
-                out = subprocess.run(
-                    ["ipconfig", "getpacket", iface],
-                    capture_output=True, text=True, errors="ignore", timeout=5,
-                )
-                if out.returncode == 0 and out.stdout.strip():
-                    return "dhcp"
-                return "static"
-    except (subprocess.SubprocessError, OSError, FileNotFoundError):
-        pass
-    return "unknown"
+            if not iface:
+                errors.append(f"could not find a network interface for {local_ip}")
+                return "unknown", errors
+            out = subprocess.run(
+                ["ipconfig", "getpacket", iface],
+                capture_output=True, text=True, errors="ignore", timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return "dhcp", errors
+            return "static", errors
+    except Exception as e:
+        errors.append(f"unexpected error checking dhcp/static: {e}")
+
+    return "unknown", errors
 
 
 def _ping_once(ip, timeout_ms=1000):
@@ -592,7 +714,15 @@ def _scan_wifi_windows(errors):
         return networks
 
     if result.returncode != 0:
-        errors.append(f"netsh failed: {(result.stderr or result.stdout).strip()}")
+        msg = (result.stderr or result.stdout).strip()
+        errors.append(f"netsh failed: {msg}")
+        if "powered down" in msg.lower():
+            errors.append(
+                "The Wi-Fi adapter is turned off -- check the physical Wi-Fi switch/"
+                "function key, Airplane mode, or enable the adapter in Windows network "
+                "adapter settings. (See the interface status list above -- Wi-Fi should "
+                "show as DOWN there too.)"
+            )
         return networks
 
     current = {}
@@ -889,15 +1019,19 @@ def run_discovery(skip_ports=False, skip_wifi=False):
     print("Detecting local network...")
     local_ip, network_str = get_local_ip_and_subnet()
     gateway_ip = get_default_gateway()
-    dns_servers = get_dns_servers()
-    ip_mode = get_ip_assignment_mode(local_ip)
+    dns_servers, dns_errors = get_dns_servers()
+    ip_mode, ip_mode_errors = get_ip_assignment_mode(local_ip)
     print(f"  Local IP: {local_ip} ({ip_mode})")
     print(f"  Subnet:   {network_str}")
     print(f"  Gateway:  {gateway_ip or 'not found'}")
     print(f"  DNS:      {', '.join(dns_servers) if dns_servers else 'not found'}")
+    for err in dns_errors + ip_mode_errors:
+        print(f"  ! {err}")
 
     print("\nChecking network interfaces...")
-    interfaces = get_interface_status()
+    interfaces, iface_errors = get_interface_status()
+    for err in iface_errors:
+        print(f"  ! {err}")
     for iface in interfaces:
         state = "up" if iface["up"] else "DOWN"
         print(f"  {iface['name']:<12} type={iface['type']:<9} {state}")
@@ -966,10 +1100,13 @@ def run_discovery(skip_ports=False, skip_wifi=False):
     return {
         "local_ip": local_ip,
         "ip_assignment_mode": ip_mode,
+        "ip_assignment_errors": ip_mode_errors,
         "subnet": network_str,
         "gateway": gateway_ip,
         "dns_servers": dns_servers,
+        "dns_scan_errors": dns_errors,
         "interfaces": interfaces,
+        "interface_scan_errors": iface_errors,
         "pool_usage": pool_usage,
         "devices": devices,
         "wifi_networks": wifi_networks,
