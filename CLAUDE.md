@@ -126,10 +126,27 @@ a non-technical install target later). Current version does:
 - IP pool usage (`calculate_pool_usage()`) — used/free/percent across the
   *scanned subnet*. **Known gap:** not the router's actual configured
   DHCP range, which we can't know without asking the router directly
-- Network interface status (`get_interface_status()`) — up/down + a
-  best-effort ethernet/wifi guess per interface (exact on macOS via a
-  hardware-port lookup, name-based guess elsewhere — **known gap** on
-  Windows/Linux if a machine uses non-obvious interface naming)
+- Network interface status (`get_interface_status()`) — a best-effort
+  ethernet/wifi guess per interface (exact on macOS via a hardware-port
+  lookup, name-based guess elsewhere — **known gap** on Windows/Linux if
+  a machine uses non-obvious interface naming), plus two *separate*
+  signals per interface rather than one collapsed up/down bool:
+  `admin_enabled` (was the adapter itself turned on/off — this is what
+  answers "were the adapters set to on or off in Windows") and
+  `connected` (is it actually carrying a link right now). An adapter can
+  be enabled but not connected — different situation from disabled
+  outright, worth telling apart
+- Wi-Fi radio hardware/software kill state (`get_wifi_radio_state()`,
+  `netsh`/`rfkill`). **Deliberately does not read Windows' actual
+  system-wide Airplane Mode flag** — no reliable stdlib-only way to do
+  that (the documented method needs fragile WinRT/PowerShell interop
+  unverifiable without a Windows machine; the alternative is an
+  undocumented registry key whose on/off value mapping can't be
+  confirmed without hardware either, and a confidently-wrong reading is
+  worse than not having it). Software-radio-off is the actual mechanism
+  Airplane Mode and Fn-key Wi-Fi toggles both use, so this answers the
+  practical question without claiming to read the OS flag. Not
+  applicable on macOS — no OS-level Airplane Mode exists there
 - Static-vs-DHCP detection (`get_ip_assignment_mode()`). **Known gap:**
   Linux detection needs NetworkManager (`nmcli`) managing the interface;
   returns `"unknown"` rather than guessing wrong if it's not present

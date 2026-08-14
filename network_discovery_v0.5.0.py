@@ -3,8 +3,28 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.4.0
+VERSION: 0.5.0
 CHANGELOG:
+  0.5.0 - Two more items from Ammar's list:
+            - get_interface_status() now reports admin_enabled and
+              connected as two separate fields instead of one collapsed
+              "up" bool -- an adapter can be enabled but not connected
+              (cable unplugged, nothing in range), which is a different
+              situation from being disabled outright, and worth telling
+              apart. This is also what answers "were the adapters set to
+              on or off in Windows" directly, using data this file was
+              already fetching.
+            - get_wifi_radio_state(): hardware/software Wi-Fi radio kill
+              state (netsh on Windows, rfkill on Linux). Deliberately
+              does NOT claim to read Windows' actual system-wide
+              "Airplane Mode" flag -- see the function's docstring for
+              why (no reliable stdlib-only way to do that without either
+              fragile PowerShell/WinRT interop or an unverified registry
+              key). Software-off is the mechanism Airplane Mode and
+              Fn-key Wi-Fi toggles both actually use, so this answers the
+              practical question even without reading the OS flag
+              directly. Not applicable on macOS -- no OS-level Airplane
+              Mode exists there.
   0.4.0 - Fixed the same silent-failure bug from v0.2.0, this time in the
           v0.3.0 additions: Ammar tested on real Windows hardware and
           get_interface_status() came back completely empty (no Ethernet,
@@ -69,9 +89,9 @@ CHANGELOG:
 
 Standard-library only. No pip installs, on purpose -- see CLAUDE.md for why.
 
-Run it directly:  python3 network_discovery_v0.4.0.py
-Skip the slow steps while testing:  python3 network_discovery_v0.4.0.py --no-ports --no-wifi
-Dump machine-readable output:       python3 network_discovery_v0.4.0.py --json out.json
+Run it directly:  python3 network_discovery_v0.5.0.py
+Skip the slow steps while testing:  python3 network_discovery_v0.5.0.py --no-ports --no-wifi
+Dump machine-readable output:       python3 network_discovery_v0.5.0.py --json out.json
 
 Note on Wi-Fi scanning permissions: on Linux, actually triggering a scan
 (as opposed to reading a cached list) usually needs root. If you see a
@@ -380,8 +400,16 @@ def _guess_interface_type(name):
 
 def get_interface_status():
     """
-    Lists network interfaces and whether each is up or down, with a
-    best-effort ethernet/wifi guess per interface.
+    Lists network interfaces with two separate signals per interface,
+    not one collapsed "up" bool:
+      - admin_enabled: was the adapter itself turned on/off (Windows
+        adapter settings "Enable"/"Disable", Linux/macOS admin UP flag)
+      - connected: is it actually carrying a link right now (Windows
+        "Connected"/"Disconnected", Linux LOWER_UP flag, macOS
+        "status: active/inactive")
+    An adapter can be enabled but not connected (cable unplugged, no
+    network in range) -- that's a different situation from the adapter
+    being disabled outright, and worth telling apart.
 
     Returns (interfaces, errors) -- same pattern as scan_wifi_networks().
     An earlier version of this function had the exact silent-failure bug
@@ -405,11 +433,12 @@ def get_interface_status():
             for line in result.stdout.splitlines():
                 parts = line.split(None, 3)
                 if len(parts) == 4 and parts[0] in ("Enabled", "Disabled"):
-                    admin_state, state, _if_type, name = parts
+                    admin_state, conn_state, _if_type, name = parts
                     interfaces.append({
                         "name": name.strip(),
                         "type": _guess_interface_type(name),
-                        "up": admin_state == "Enabled" and state == "Connected",
+                        "admin_enabled": admin_state == "Enabled",
+                        "connected": conn_state == "Connected",
                     })
             if not interfaces:
                 snippet = "\n".join(result.stdout.splitlines()[:6])
@@ -438,7 +467,8 @@ def get_interface_status():
                 interfaces.append({
                     "name": name,
                     "type": _guess_interface_type(name),
-                    "up": "UP" in flags,
+                    "admin_enabled": "UP" in flags,
+                    "connected": "LOWER_UP" in flags,
                 })
             if not interfaces:
                 errors.append("ip link show ran but found no non-loopback interfaces")
@@ -461,10 +491,12 @@ def get_interface_status():
                 name, flags = m.group(1), m.group(2).split(",")
                 if name == "lo0":
                     continue
+                status_m = re.search(r"status:\s*(\w+)", block)
                 interfaces.append({
                     "name": name,
                     "type": mac_types.get(name, _guess_interface_type(name)),
-                    "up": "UP" in flags,
+                    "admin_enabled": "UP" in flags,
+                    "connected": (status_m.group(1) == "active") if status_m else None,
                 })
             if not interfaces:
                 errors.append("ifconfig ran but found no non-loopback interfaces")
@@ -472,6 +504,88 @@ def get_interface_status():
         errors.append(f"unexpected error checking interfaces: {e}")
 
     return interfaces, errors
+
+
+def get_wifi_radio_state():
+    """
+    Reports the Wi-Fi radio's hardware/software on-off state --
+    "hardware" is a physical switch/killswitch, "software" is a radio
+    kill done in software, which is the actual mechanism both Airplane
+    Mode and Fn-key Wi-Fi toggles use.
+
+    This deliberately does NOT claim to read Windows' system-wide
+    "Airplane Mode" setting directly. The documented way to do that needs
+    WinRT interop through PowerShell, which is fragile to write blind
+    without a Windows machine to test against; the alternative is an
+    undocumented registry key whose exact on/off value mapping isn't
+    something that could be verified without hardware either, and
+    shipping a confidently-wrong on/off reading is worse than not having
+    the feature. Hardware/software radio state is the practical
+    diagnostic that actually matters here, and it's readable through
+    netsh/rfkill, tools this file already trusts.
+
+    Not applicable on macOS -- there's no OS-level Airplane Mode there,
+    Wi-Fi power is a per-adapter toggle only (see scan_wifi_networks()).
+
+    Known gap: the Windows netsh output parsing hasn't been confirmed
+    against real hardware. If it comes back with a parse error, that's
+    expected until tested -- the error includes a snippet of the raw
+    output so the parsing can be corrected in one pass.
+
+    Returns ({"hardware": "on"/"off"/None, "software": "on"/"off"/None}, errors).
+    """
+    state = {"hardware": None, "software": None}
+    errors = []
+    try:
+        if SYSTEM == "Windows":
+            try:
+                result = subprocess.run(["netsh", "wlan", "show", "interfaces"], capture_output=True, text=True, errors="ignore", timeout=10)
+            except FileNotFoundError:
+                errors.append("netsh not found (unexpected on Windows)")
+                return state, errors
+            if result.returncode != 0:
+                errors.append(f"netsh wlan show interfaces failed: {(result.stderr or result.stdout).strip()}")
+                return state, errors
+
+            hw_m = re.search(r"Hardware\s+(On|Off)", result.stdout)
+            sw_m = re.search(r"Software\s+(On|Off)", result.stdout)
+            if hw_m:
+                state["hardware"] = hw_m.group(1).lower()
+            if sw_m:
+                state["software"] = sw_m.group(1).lower()
+            if not hw_m and not sw_m:
+                snippet = "\n".join(result.stdout.splitlines()[:12])
+                errors.append(
+                    "netsh wlan show interfaces ran but no \"Radio status\" was found -- "
+                    f"output format may not match what this code expects. First lines:\n{snippet}"
+                )
+
+        elif SYSTEM == "Linux":
+            try:
+                result = subprocess.run(["rfkill", "list"], capture_output=True, text=True, timeout=10)
+            except FileNotFoundError:
+                errors.append("rfkill not installed (install util-linux's rfkill, or try `nmcli radio wifi`)")
+                return state, errors
+            if result.returncode != 0:
+                errors.append(f"rfkill list failed: {(result.stderr or result.stdout).strip()}")
+                return state, errors
+
+            in_wifi = False
+            for line in result.stdout.splitlines():
+                if re.match(r"^\d+:\s", line):
+                    in_wifi = any(w in line.lower() for w in ("wlan", "wireless", "wifi"))
+                elif in_wifi and "Soft blocked" in line:
+                    state["software"] = "off" if "yes" in line.lower() else "on"
+                elif in_wifi and "Hard blocked" in line:
+                    state["hardware"] = "off" if "yes" in line.lower() else "on"
+            if state["hardware"] is None and state["software"] is None:
+                errors.append("rfkill list ran but found no Wi-Fi radio entry")
+        # SYSTEM == "Darwin": intentionally left as (None, None) with no
+        # errors -- not a failure, just not a thing macOS has.
+    except Exception as e:
+        errors.append(f"unexpected error checking Wi-Fi radio state: {e}")
+
+    return state, errors
 
 
 def get_ip_assignment_mode(local_ip):
@@ -1033,8 +1147,22 @@ def run_discovery(skip_ports=False, skip_wifi=False):
     for err in iface_errors:
         print(f"  ! {err}")
     for iface in interfaces:
-        state = "up" if iface["up"] else "DOWN"
-        print(f"  {iface['name']:<12} type={iface['type']:<9} {state}")
+        admin = "enabled" if iface["admin_enabled"] else "DISABLED"
+        if iface["connected"] is None:
+            conn = "connected: unknown"
+        else:
+            conn = "connected" if iface["connected"] else "not connected"
+        print(f"  {iface['name']:<12} type={iface['type']:<9} {admin:<10} {conn}")
+
+    wifi_radio, wifi_radio_errors = get_wifi_radio_state()
+    if wifi_radio["hardware"] or wifi_radio["software"]:
+        print(f"  Wi-Fi radio: hardware={wifi_radio['hardware'] or '?'} software={wifi_radio['software'] or '?'}")
+        if wifi_radio["software"] == "off":
+            print("    Wi-Fi is software-disabled -- this is what Airplane Mode or an Fn-key Wi-Fi toggle turns off.")
+        if wifi_radio["hardware"] == "off":
+            print("    Wi-Fi is hardware-disabled -- check for a physical Wi-Fi switch.")
+    for err in wifi_radio_errors:
+        print(f"  ! {err}")
 
     print("\nPinging subnet (this can take a bit)...")
     alive = ping_sweep(network_str)
@@ -1107,6 +1235,8 @@ def run_discovery(skip_ports=False, skip_wifi=False):
         "dns_scan_errors": dns_errors,
         "interfaces": interfaces,
         "interface_scan_errors": iface_errors,
+        "wifi_radio_state": wifi_radio,
+        "wifi_radio_errors": wifi_radio_errors,
         "pool_usage": pool_usage,
         "devices": devices,
         "wifi_networks": wifi_networks,
