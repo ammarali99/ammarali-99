@@ -204,7 +204,40 @@ a non-technical install target later). Current version does:
 - `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` flags to
   skip slower or internet/LAN-broadcast-touching steps
 
-Everything else (A2 through A7) is not started yet.
+**A2 (Rule Engine) is started (v0.1.0).** Standard-library-only Python,
+in its own file (`a2_rule_engine_v0.1.0.py`), deliberately never importing
+A1's file directly -- it reads the same dict A1's `--json` export produces
+(file-based handoff: A1 writes `--json scan.json`, A2 reads `--input
+scan.json`), so A1 can keep bumping its own version/filename with zero
+changes needed in A2. Current version does:
+
+- A Finding schema (`finding_id`, `rule_id`, `category`, `severity`,
+  `target`, `summary`, `detail`, `fix_classification`, `evidence`,
+  `detected_at`) designed to already be the row shape A6 will store, once
+  A6 exists -- `finding_id` is a stable hash of (rule, target) so the same
+  issue re-detected on a later scan is recognizable as the same finding
+  (needed for AI1's later cross-scan correlation), `category` groups
+  findings by subsystem (wifi/wan/lan/interface/dhcp/security) for AI1 and
+  for A5's report sectioning, and `fix_classification`
+  (auto-fix/guided-fix/not-fixable) is decided here for A3 to act on later
+- `evaluate()`: runs every registered rule against A1's discovery dict,
+  wrapping each one individually so one rule raising an exception doesn't
+  take down the rest (same defensive pattern as A1's own scan steps)
+- First rule set (10 rules): Wi-Fi radio off (hardware/software), adapter
+  disabled, adapter enabled-but-not-connected, no gateway found, gateway
+  unreachable/high packet loss/high latency, internet unreachable (with a
+  WAN-vs-LAN distinction based on whether the gateway itself is reachable),
+  IP pool near exhaustion, UPnP sanity notes surfaced as findings (passed
+  through from A1's `_upnp_sanity_notes()` rather than re-parsed here, to
+  avoid a second, fragile copy of that detection logic), insecure Telnet
+  port open, Wi-Fi channel congestion recommendation, DNS not configured
+- CLI: prints findings sorted by severity with a summary count, `--json`
+  export in the same shape A6 will eventually store directly
+- Tested end-to-end against this file's own A1 output plus synthetic data
+  covering every rule; **not yet tested against Ammar's real hardware
+  scans** -- next step before adding more rules
+
+Everything else (A3 through A7) is not started yet.
 
 ## Flagged / open decisions
 
@@ -268,7 +301,7 @@ Everything else (A2 through A7) is not started yet.
 - Expand the MAC vendor OUI table (known gap, flagged above)
 - Add mDNS and SNMP to A1's discovery methods (currently ARP/ping/hostname/
   port-probe/Wi-Fi only)
-- Build out A2 (Rule Engine) on top of A1's output
+- Test A2 against Ammar's real hardware scans, then expand its rule set
 - A4 (Snapshot/Rollback) before A3 (Fix Engine) — rollback has to exist
   before anything is allowed to touch a device's config
 - AI layer (AI1) stays deferred until after a working core (A1-A7 minus AI1)
