@@ -237,6 +237,16 @@ changes needed in A2. Current version does:
   covering every rule; **not yet tested against Ammar's real hardware
   scans** -- next step before adding more rules
 
+**Note: the A1-to-A2 JSON file handoff is temporary, not the final
+design.** A1 and A2 currently pass data through a JSON file
+(`--json scan.json` / `--input scan.json`) because A6 (the encrypted local
+cache) doesn't exist yet. Once A6 is built, this gets fixed: both A1 and
+A2 write/read through A6 directly instead of a JSON file, matching the
+architecture's real rule that every module writes to A6 first. This is a
+small plumbing change, not a rewrite -- A2's Finding schema is already
+designed to be the exact row shape A6 will store, so only the storage
+call changes (`json.dump()` -> `a6.write_findings()`), not the rule logic.
+
 Everything else (A3 through A7) is not started yet.
 
 ## Flagged / open decisions
