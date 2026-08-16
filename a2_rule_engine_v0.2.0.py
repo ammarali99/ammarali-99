@@ -3,8 +3,50 @@
 a2_rule_engine.py -- Module A2 (Rule Engine) of the offline network
 diagnostic app.
 
-VERSION: 0.1.0
+VERSION: 0.2.0
 CHANGELOG:
+  0.2.0 - Ammar's first real-hardware test (a machine with Wi-Fi switched
+          off in software but Ethernet providing a working internet
+          connection) surfaced a real design problem, not a bug: A2 was
+          reporting "Wi-Fi radio off" as CRITICAL and "Wi-Fi adapter not
+          connected" as WARNING even though neither was actually affecting
+          the customer -- their internet worked fine. A finding engine
+          that cries wolf about component-level state that isn't causing
+          any real problem is exactly the kind of thing CLAUDE.md flags as
+          the biggest non-technical risk in this market: it erodes trust.
+
+          Added _connectivity_context(data): a coarse read of whether the
+          customer's internet is actually working right now (from A1's
+          internet reachability check), used only to decide how *alarming*
+          an interface/radio-level finding should be -- not whether to
+          detect it at all. Wi-Fi radio off and "adapter enabled but not
+          connected" (check_wifi_radio_off, check_interfaces) now scale
+          their severity by this context: still flagged plainly, but as
+          info instead of critical/warning when the internet is
+          confirmed working (something else -- probably Ethernet -- is
+          carrying the connection), and unchanged (critical/warning) when
+          the internet is confirmed down, where they're a plausible cause
+          worth surfacing loudly. When the internet check itself was
+          skipped (--no-internet), severity stays at the original,
+          unconditional default -- we genuinely don't know either way,
+          and guessing wrong is worse than not adjusting at all.
+
+          This is deliberately still a deterministic A2 rule, not AI1's
+          job: it doesn't correlate across scans or learn anything, it
+          just reads one extra field (internet.reachable) already sitting
+          in A1's discovery dict before deciding severity. AI1 (deferred)
+          will eventually do richer, learned correlation on top of this;
+          this is the simple, obvious version that doesn't need to wait
+          for it.
+
+          Every other rule (gateway latency, IP pool usage, insecure
+          Telnet, DNS missing, UPnP notes, channel congestion) is
+          deliberately left unconditional -- these matter regardless of
+          whether the internet happens to be up right now (a nearly-full
+          DHCP pool or high gateway latency is a real, standing problem
+          even on a connection that currently "works"), which is exactly
+          Ammar's second point: show real degradation always, don't only
+          gate on "is there an outage."
   0.1.0 - First version. Deterministic, known-issue rules that turn A1's
           discovery data into a list of structured Findings.
 
@@ -35,7 +77,7 @@ Standard-library only. No pip installs, same reason as A1 -- see CLAUDE.md.
 
 Run it against a saved scan:
     python3 network_discovery_v0.8.0.py --json scan.json
-    python3 a2_rule_engine_v0.1.0.py --input scan.json
+    python3 a2_rule_engine_v0.2.0.py --input scan.json
 
 Note: this has to be a two-step, file-based handoff, not a direct pipe.
 A1's `--json` with no path still prints its normal plain-language output
@@ -44,7 +86,7 @@ A2 hands it a mix of prose and JSON, not valid JSON on its own. Always
 give A1 a real path (`--json scan.json`) when the output is meant for A2.
 
 Dump findings as JSON instead of/alongside the plain-language printout:
-    python3 a2_rule_engine_v0.1.0.py --input scan.json --json findings.json
+    python3 a2_rule_engine_v0.2.0.py --input scan.json --json findings.json
 """
 
 import argparse
@@ -106,47 +148,118 @@ def make_finding(rule_id, category, severity, target, summary, detail,
 # exception doesn't take down the rest (see evaluate()).
 # ---------------------------------------------------------------------
 
+def _connectivity_context(data):
+    """
+    Coarse read of whether the customer's internet is actually working
+    right now, used only to decide how alarming an interface/radio-level
+    finding should be -- not whether to detect it at all. A1 doesn't tell
+    us which interface is actually carrying the connection, so this isn't
+    per-interface attribution, just "is the network working overall."
+
+    Returns "ok" (internet reachable), "broken" (confirmed unreachable),
+    or "unknown" (the internet check was skipped with --no-internet, so
+    we genuinely don't know either way -- treated the same as A1 treats
+    an unreadable field: don't guess, use the original unconditional
+    severity instead of silently downgrading it).
+    """
+    reachable = (data.get("internet") or {}).get("reachable")
+    if reachable is True:
+        return "ok"
+    if reachable is False:
+        return "broken"
+    return "unknown"
+
+
 def check_wifi_radio_off(data):
+    """
+    Flags the Wi-Fi radio being off in hardware or software. Severity
+    scales with whether the customer's internet is actually working:
+    Wi-Fi off while the internet works fine (something else is carrying
+    the connection, usually Ethernet) is background state, not a
+    problem -- reported as info, not critical. Wi-Fi off while the
+    internet is confirmed down is a plausible cause worth surfacing
+    loudly -- unchanged critical severity. See _connectivity_context().
+    """
     findings = []
     radio = data.get("wifi_radio_state") or {}
-    if radio.get("software") == "off":
+    context = _connectivity_context(data)
+    kinds = (
+        ("software", "in software (Airplane Mode or an Fn-key toggle)"),
+        ("hardware", "at the hardware level -- check for a physical Wi-Fi switch"),
+    )
+    for key, phrase in kinds:
+        if radio.get(key) != "off":
+            continue
+        if context == "ok":
+            severity = SEV_INFO
+            summary = (f"Wi-Fi is off {phrase}, but this isn't affecting your connection "
+                       "right now -- your internet is working (probably via another connection).")
+        elif context == "broken":
+            severity = SEV_CRITICAL
+            summary = f"Wi-Fi is off {phrase} -- likely why there's no internet connection."
+        else:
+            severity = SEV_CRITICAL
+            summary = f"Wi-Fi is off {phrase}."
         findings.append(make_finding(
-            rule_id="wifi_radio_software_off", category="wifi", severity=SEV_CRITICAL,
-            target="wifi_radio",
-            summary="Wi-Fi is turned off in software (Airplane Mode or an Fn-key toggle).",
-            detail="wifi_radio_state.software == 'off'",
-            fix_classification=FIX_GUIDED, evidence={"wifi_radio_state": radio},
-        ))
-    if radio.get("hardware") == "off":
-        findings.append(make_finding(
-            rule_id="wifi_radio_hardware_off", category="wifi", severity=SEV_CRITICAL,
-            target="wifi_radio",
-            summary="Wi-Fi is off at the hardware level -- check for a physical Wi-Fi switch.",
-            detail="wifi_radio_state.hardware == 'off'",
-            fix_classification=FIX_GUIDED, evidence={"wifi_radio_state": radio},
+            rule_id=f"wifi_radio_{key}_off", category="wifi", severity=severity,
+            target="wifi_radio", summary=summary,
+            detail=f"wifi_radio_state.{key} == 'off', connectivity_context={context}",
+            fix_classification=FIX_GUIDED,
+            evidence={"wifi_radio_state": radio, "internet": data.get("internet")},
         ))
     return findings
 
 
 def check_interfaces(data):
+    """
+    Flags a disabled adapter, or one that's enabled but not connected.
+    Same severity-scaling reasoning as check_wifi_radio_off(): background
+    state when the internet works fine regardless, a plausible cause when
+    it's confirmed down.
+    """
     findings = []
+    context = _connectivity_context(data)
     for iface in data.get("interfaces") or []:
         name = iface.get("name", "unknown")
         if iface.get("admin_enabled") is False:
+            if context == "ok":
+                severity = SEV_INFO
+                summary = (f"Network adapter '{name}' is disabled, but this isn't affecting "
+                           "your connection right now -- your internet is working.")
+            elif context == "broken":
+                severity = SEV_WARNING
+                summary = f"Network adapter '{name}' is disabled -- possibly why there's no internet connection."
+            else:
+                severity = SEV_WARNING
+                summary = f"Network adapter '{name}' is disabled."
             findings.append(make_finding(
-                rule_id="interface_disabled", category="interface", severity=SEV_WARNING,
-                target=name, summary=f"Network adapter '{name}' is disabled.",
-                detail="admin_enabled == False",
-                fix_classification=FIX_GUIDED, evidence={"interface": iface},
+                rule_id="interface_disabled", category="interface", severity=severity,
+                target=name, summary=summary,
+                detail=f"admin_enabled == False, connectivity_context={context}",
+                fix_classification=FIX_GUIDED,
+                evidence={"interface": iface, "internet": data.get("internet")},
             ))
         elif iface.get("admin_enabled") is True and iface.get("connected") is False:
+            if context == "ok":
+                severity = SEV_INFO
+                summary = (f"Network adapter '{name}' is enabled but not connected, but this "
+                           "isn't affecting your connection right now -- your internet is "
+                           "working (probably via another connection).")
+            elif context == "broken":
+                severity = SEV_WARNING
+                summary = (f"Network adapter '{name}' is enabled but not connected "
+                           "(cable unplugged, or nothing in Wi-Fi range) -- possibly why "
+                           "there's no internet connection.")
+            else:
+                severity = SEV_WARNING
+                summary = (f"Network adapter '{name}' is enabled but not connected "
+                           "(cable unplugged, or nothing in Wi-Fi range).")
             findings.append(make_finding(
-                rule_id="interface_not_connected", category="interface", severity=SEV_WARNING,
-                target=name,
-                summary=f"Network adapter '{name}' is enabled but not connected "
-                        "(cable unplugged, or nothing in Wi-Fi range).",
-                detail="admin_enabled == True, connected == False",
-                fix_classification=FIX_GUIDED, evidence={"interface": iface},
+                rule_id="interface_not_connected", category="interface", severity=severity,
+                target=name, summary=summary,
+                detail=f"admin_enabled == True, connected == False, connectivity_context={context}",
+                fix_classification=FIX_GUIDED,
+                evidence={"interface": iface, "internet": data.get("internet")},
             ))
         # connected is None means "unknown" (see A1) -- deliberately not
         # flagged, same reasoning A1 uses: a confidently-wrong finding is

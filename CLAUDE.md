@@ -204,8 +204,8 @@ a non-technical install target later). Current version does:
 - `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` flags to
   skip slower or internet/LAN-broadcast-touching steps
 
-**A2 (Rule Engine) is started (v0.1.0).** Standard-library-only Python,
-in its own file (`a2_rule_engine_v0.1.0.py`), deliberately never importing
+**A2 (Rule Engine) is started (v0.2.0).** Standard-library-only Python,
+in its own file (`a2_rule_engine_v0.2.0.py`), deliberately never importing
 A1's file directly -- it reads the same dict A1's `--json` export produces
 (file-based handoff: A1 writes `--json scan.json`, A2 reads `--input
 scan.json`), so A1 can keep bumping its own version/filename with zero
@@ -233,9 +233,32 @@ changes needed in A2. Current version does:
   port open, Wi-Fi channel congestion recommendation, DNS not configured
 - CLI: prints findings sorted by severity with a summary count, `--json`
   export in the same shape A6 will eventually store directly
-- Tested end-to-end against this file's own A1 output plus synthetic data
-  covering every rule; **not yet tested against Ammar's real hardware
-  scans** -- next step before adding more rules
+- **Severity now scales with actual connectivity impact (v0.2.0), not just
+  raw component state.** Ammar's first real-hardware test (Wi-Fi switched
+  off in software, but Ethernet was providing a working internet
+  connection) surfaced a real trust problem: A2 was reporting "Wi-Fi radio
+  off" as CRITICAL even though it wasn't affecting him at all. A confident
+  false alarm on working hardware is exactly the kind of thing that erodes
+  the non-technical trust CLAUDE.md flags as the biggest risk in this
+  market. `_connectivity_context()` reads A1's internet-reachability
+  result and scales `check_wifi_radio_off()` / `check_interfaces()`
+  accordingly: info-level (not critical/warning) when the internet is
+  confirmed working -- something else is carrying the connection --
+  unchanged critical/warning when the internet is confirmed down, where
+  they're a plausible cause worth surfacing loudly, and unchanged
+  critical/warning (the safe default) when the internet check itself was
+  skipped (`--no-internet`) and there's genuinely no way to know. This is
+  still a deterministic A2 rule, not AI1's job -- it doesn't correlate
+  across scans or learn anything, it just reads one more field already in
+  A1's discovery dict before deciding severity. Every other rule (gateway
+  latency, IP pool usage, insecure Telnet, DNS missing, UPnP notes,
+  channel congestion) is deliberately left unconditional, since those
+  matter regardless of whether the internet happens to be up right now --
+  Ammar's second point from the same test.
+- Tested end-to-end against this file's own A1 output, synthetic data
+  covering every rule, and Ammar's first real hardware scan (which is what
+  surfaced the v0.2.0 fix above) -- next up: run the corrected version
+  against real hardware again to confirm, then expand the rule set
 
 **Note: the A1-to-A2 JSON file handoff is temporary, not the final
 design.** A1 and A2 currently pass data through a JSON file
