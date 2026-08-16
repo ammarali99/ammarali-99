@@ -3,8 +3,21 @@
 a2_rule_engine.py -- Module A2 (Rule Engine) of the offline network
 diagnostic app.
 
-VERSION: 0.2.0
+VERSION: 0.3.0
 CHANGELOG:
+  0.3.0 - A1 v0.9.0 added dns_resolution (servers_tested, any_working) --
+          whether each configured DNS server actually resolves names, not
+          just whether one is configured. Added check_dns_not_resolving():
+          flags "internet is reachable but no configured DNS server is
+          working," which looks like "internet is down" to a non-technical
+          user but needs a completely different fix (switch DNS server,
+          not touch Wi-Fi/Ethernet). Kept separate from
+          check_internet_reachability() rather than folded in, since it's
+          a distinct root cause with a distinct guided-fix. Doesn't need
+          connectivity-context scaling like v0.2.0's interface/radio
+          rules -- its trigger condition (internet reachable, DNS not) is
+          already specific enough to always be worth surfacing, same as
+          check_dns_missing() and check_pool_usage().
   0.2.0 - Ammar's first real-hardware test (a machine with Wi-Fi switched
           off in software but Ethernet providing a working internet
           connection) surfaced a real design problem, not a bug: A2 was
@@ -76,8 +89,8 @@ CHANGELOG:
 Standard-library only. No pip installs, same reason as A1 -- see CLAUDE.md.
 
 Run it against a saved scan:
-    python3 network_discovery_v0.8.0.py --json scan.json
-    python3 a2_rule_engine_v0.2.0.py --input scan.json
+    python3 network_discovery_v0.9.0.py --json scan.json
+    python3 a2_rule_engine_v0.3.0.py --input scan.json
 
 Note: this has to be a two-step, file-based handoff, not a direct pipe.
 A1's `--json` with no path still prints its normal plain-language output
@@ -86,7 +99,7 @@ A2 hands it a mix of prose and JSON, not valid JSON on its own. Always
 give A1 a real path (`--json scan.json`) when the output is meant for A2.
 
 Dump findings as JSON instead of/alongside the plain-language printout:
-    python3 a2_rule_engine_v0.2.0.py --input scan.json --json findings.json
+    python3 a2_rule_engine_v0.3.0.py --input scan.json --json findings.json
 """
 
 import argparse
@@ -406,6 +419,33 @@ def check_dns_missing(data):
     return []
 
 
+def check_dns_not_resolving(data):
+    """
+    Flags "internet is reachable but no configured DNS server actually
+    resolves names" -- ISP DNS down, DNS hijacked, a captive portal. This
+    looks identical to "internet is down" to a non-technical user, but
+    needs a completely different fix (switch DNS server, not touch
+    Wi-Fi/Ethernet), so it's worth its own finding rather than folding
+    into check_internet_reachability(). Only fires when A1's
+    dns_resolution check actually ran -- any_working is None (not False)
+    when it was skipped (--no-internet) or there were no servers to test.
+    """
+    internet = data.get("internet") or {}
+    dns_res = data.get("dns_resolution") or {}
+    if internet.get("reachable") is True and dns_res.get("any_working") is False:
+        tested = dns_res.get("servers_tested") or []
+        servers = ", ".join(r["server"] for r in tested) or "the configured server(s)"
+        return [make_finding(
+            rule_id="dns_not_resolving", category="dhcp", severity=SEV_WARNING,
+            target="dns",
+            summary=(f"Internet is working, but DNS isn't resolving names ({servers}) "
+                     "-- try switching to a different DNS server."),
+            detail=str(dns_res), fix_classification=FIX_GUIDED,
+            evidence={"dns_resolution": dns_res, "internet": internet},
+        )]
+    return []
+
+
 # Every rule the engine runs. Add new checks here.
 RULES = [
     check_wifi_radio_off,
@@ -418,6 +458,7 @@ RULES = [
     check_insecure_ports,
     check_wifi_channel_recommendation,
     check_dns_missing,
+    check_dns_not_resolving,
 ]
 
 
