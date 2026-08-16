@@ -219,7 +219,73 @@ a non-technical install target later). Current version does:
 - `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` flags to
   skip slower or internet/LAN-broadcast-touching steps
 
-Everything else (A2 through A7) is not started yet.
+**A2 (Rule Engine) is started (v0.2.0).** Standard-library-only Python,
+in its own file (`a2_rule_engine_v0.2.0.py`), deliberately never importing
+A1's file directly -- it reads the same dict A1's `--json` export produces
+(file-based handoff: A1 writes `--json scan.json`, A2 reads `--input
+scan.json`), so A1 can keep bumping its own version/filename with zero
+changes needed in A2. Current version does:
+
+- A Finding schema (`finding_id`, `rule_id`, `category`, `severity`,
+  `target`, `summary`, `detail`, `fix_classification`, `evidence`,
+  `detected_at`) designed to already be the row shape A6 will store, once
+  A6 exists -- `finding_id` is a stable hash of (rule, target) so the same
+  issue re-detected on a later scan is recognizable as the same finding
+  (needed for AI1's later cross-scan correlation), `category` groups
+  findings by subsystem (wifi/wan/lan/interface/dhcp/security) for AI1 and
+  for A5's report sectioning, and `fix_classification`
+  (auto-fix/guided-fix/not-fixable) is decided here for A3 to act on later
+- `evaluate()`: runs every registered rule against A1's discovery dict,
+  wrapping each one individually so one rule raising an exception doesn't
+  take down the rest (same defensive pattern as A1's own scan steps)
+- First rule set (10 rules): Wi-Fi radio off (hardware/software), adapter
+  disabled, adapter enabled-but-not-connected, no gateway found, gateway
+  unreachable/high packet loss/high latency, internet unreachable (with a
+  WAN-vs-LAN distinction based on whether the gateway itself is reachable),
+  IP pool near exhaustion, UPnP sanity notes surfaced as findings (passed
+  through from A1's `_upnp_sanity_notes()` rather than re-parsed here, to
+  avoid a second, fragile copy of that detection logic), insecure Telnet
+  port open, Wi-Fi channel congestion recommendation, DNS not configured
+- CLI: prints findings sorted by severity with a summary count, `--json`
+  export in the same shape A6 will eventually store directly
+- **Severity now scales with actual connectivity impact (v0.2.0), not just
+  raw component state.** Ammar's first real-hardware test (Wi-Fi switched
+  off in software, but Ethernet was providing a working internet
+  connection) surfaced a real trust problem: A2 was reporting "Wi-Fi radio
+  off" as CRITICAL even though it wasn't affecting him at all. A confident
+  false alarm on working hardware is exactly the kind of thing that erodes
+  the non-technical trust CLAUDE.md flags as the biggest risk in this
+  market. `_connectivity_context()` reads A1's internet-reachability
+  result and scales `check_wifi_radio_off()` / `check_interfaces()`
+  accordingly: info-level (not critical/warning) when the internet is
+  confirmed working -- something else is carrying the connection --
+  unchanged critical/warning when the internet is confirmed down, where
+  they're a plausible cause worth surfacing loudly, and unchanged
+  critical/warning (the safe default) when the internet check itself was
+  skipped (`--no-internet`) and there's genuinely no way to know. This is
+  still a deterministic A2 rule, not AI1's job -- it doesn't correlate
+  across scans or learn anything, it just reads one more field already in
+  A1's discovery dict before deciding severity. Every other rule (gateway
+  latency, IP pool usage, insecure Telnet, DNS missing, UPnP notes,
+  channel congestion) is deliberately left unconditional, since those
+  matter regardless of whether the internet happens to be up right now --
+  Ammar's second point from the same test.
+- Tested end-to-end against this file's own A1 output, synthetic data
+  covering every rule, and Ammar's first real hardware scan (which is what
+  surfaced the v0.2.0 fix above) -- next up: run the corrected version
+  against real hardware again to confirm, then expand the rule set
+
+**Note: the A1-to-A2 JSON file handoff is temporary, not the final
+design.** A1 and A2 currently pass data through a JSON file
+(`--json scan.json` / `--input scan.json`) because A6 (the encrypted local
+cache) doesn't exist yet. Once A6 is built, this gets fixed: both A1 and
+A2 write/read through A6 directly instead of a JSON file, matching the
+architecture's real rule that every module writes to A6 first. This is a
+small plumbing change, not a rewrite -- A2's Finding schema is already
+designed to be the exact row shape A6 will store, so only the storage
+call changes (`json.dump()` -> `a6.write_findings()`), not the rule logic.
+
+Everything else (A3 through A7) is not started yet.
 
 ## Flagged / open decisions
 
@@ -283,7 +349,7 @@ Everything else (A2 through A7) is not started yet.
 - Expand the MAC vendor OUI table (known gap, flagged above)
 - Add mDNS and SNMP to A1's discovery methods (currently ARP/ping/hostname/
   port-probe/Wi-Fi only)
-- Build out A2 (Rule Engine) on top of A1's output
+- Test A2 against Ammar's real hardware scans, then expand its rule set
 - A4 (Snapshot/Rollback) before A3 (Fix Engine) — rollback has to exist
   before anything is allowed to touch a device's config
 - AI layer (AI1) stays deferred until after a working core (A1-A7 minus AI1)
