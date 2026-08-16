@@ -3,8 +3,22 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.8.0
+VERSION: 0.9.0
 CHANGELOG:
+  0.9.0 - check_dns_resolution(): tests whether each *configured* DNS
+          server actually resolves names, instead of just reading the
+          config and assuming it works. This is the "internet is
+          reachable but DNS is broken" case -- ISP DNS server down, DNS
+          hijacked/misconfigured, captive portal -- which looks
+          identical to "internet is down" to a non-technical user but
+          has a completely different fix. Sends a raw DNS query directly
+          to each server (not through the OS resolver, which can't be
+          pointed at one specific server) for example.com -- IANA-
+          reserved for documentation/testing, about as stable a target
+          as exists. This is A1's second deliberate exception to "only
+          A7 touches the internet" (see check_internet_reachability());
+          gated under the same --no-internet flag since both are the
+          same category of operation.
   0.8.0 - query_upnp_gateway() was printing whatever the router's UPnP
           stack returned as if it were trustworthy, and on Ammar's real
           Tenda router it wasn't: external_ip came back as a *private*
@@ -144,10 +158,10 @@ CHANGELOG:
 
 Standard-library only. No pip installs, on purpose -- see CLAUDE.md for why.
 
-Run it directly:  python3 network_discovery_v0.8.0.py
-Skip the slow steps while testing:  python3 network_discovery_v0.8.0.py --no-ports --no-wifi
-Stay fully offline, no exceptions: python3 network_discovery_v0.8.0.py --no-internet
-Dump machine-readable output:       python3 network_discovery_v0.8.0.py --json out.json
+Run it directly:  python3 network_discovery_v0.9.0.py
+Skip the slow steps while testing:  python3 network_discovery_v0.9.0.py --no-ports --no-wifi
+Stay fully offline, no exceptions: python3 network_discovery_v0.9.0.py --no-internet
+Dump machine-readable output:       python3 network_discovery_v0.9.0.py --json out.json
 
 Note on Wi-Fi scanning permissions: on Linux, actually triggering a scan
 (as opposed to reading a cached list) usually needs root. If you see a
@@ -158,8 +172,10 @@ import argparse
 import ipaddress
 import json
 import platform
+import random
 import re
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -871,6 +887,99 @@ def check_internet_reachability(targets=INTERNET_CHECK_TARGETS, timeout=2.0):
         finally:
             s.close()
     return {"reachable": reachable, "checks": checks}
+
+
+# IANA-reserved for documentation/testing (RFC 2606) -- guaranteed to
+# exist and never used for anything real, so it's about as stable a
+# target as a DNS resolution test can have.
+_DNS_TEST_HOSTNAME = "example.com"
+
+
+def _encode_dns_name(hostname):
+    """Encodes a hostname into DNS wire format: length-prefixed labels
+    ending in a zero byte, e.g. "example.com" -> b'\\x07example\\x03com\\x00'."""
+    parts = hostname.strip(".").split(".")
+    return b"".join(bytes([len(p)]) + p.encode("ascii") for p in parts) + b"\x00"
+
+
+def _build_dns_query(hostname, query_id):
+    """Builds a minimal DNS query packet (header + one question, type A)
+    by hand -- there's no stdlib DNS client, and we specifically need to
+    query one exact server rather than however the OS resolver decides
+    to pick among configured servers."""
+    header = struct.pack(">HHHHHH", query_id, 0x0100, 1, 0, 0, 0)
+    question = _encode_dns_name(hostname) + struct.pack(">HH", 1, 1)  # type A, class IN
+    return header + question
+
+
+def _parse_dns_response(data, expected_id):
+    """Reads just the DNS response header -- enough to know whether the
+    server answered our exact query successfully, without needing a full
+    resource-record parser."""
+    if len(data) < 12:
+        return None
+    resp_id, flags, qdcount, ancount, nscount, arcount = struct.unpack(">HHHHHH", data[:12])
+    if resp_id != expected_id:
+        return None
+    return {
+        "is_response": bool(flags & 0x8000),
+        "rcode": flags & 0x000F,
+        "answer_count": ancount,
+    }
+
+
+def check_dns_resolution(dns_servers=None, timeout=2.0):
+    """
+    Tests whether each *configured* DNS server actually resolves names,
+    instead of just reading the config and assuming it works. This is
+    the "internet is reachable but DNS is broken" case -- ISP DNS server
+    down, DNS hijacked/misconfigured, a captive portal -- which looks
+    identical to "internet is down" to a non-technical user, but has a
+    completely different fix.
+
+    A1's second deliberate exception to "only A7 touches the internet"
+    (see check_internet_reachability() and CLAUDE.md's Architecture
+    section): most configured DNS servers live off-LAN, so testing one
+    means an outbound query. Same as the reachability check, this is a
+    diagnostic TEST, not a dependency -- gated under the same
+    --no-internet flag since both are the same category of operation.
+
+    Sends a raw DNS query directly to each server (not through the OS
+    resolver, which can't be pointed at one specific server) for
+    example.com. Returns {"servers_tested": [...], "any_working": bool}.
+    """
+    if dns_servers is None:
+        dns_servers, _ = get_dns_servers()
+
+    results = []
+    for server in dns_servers:
+        query_id = random.randint(0, 65535)
+        query = _build_dns_query(_DNS_TEST_HOSTNAME, query_id)
+        start = time.monotonic()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(query, (server, 53))
+            data, _addr = sock.recvfrom(512)
+            elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+            parsed = _parse_dns_response(data, query_id)
+            if parsed and parsed["is_response"] and parsed["rcode"] == 0 and parsed["answer_count"] > 0:
+                results.append({"server": server, "working": True, "latency_ms": elapsed_ms, "error": None})
+            elif parsed:
+                results.append({
+                    "server": server, "working": False, "latency_ms": elapsed_ms,
+                    "error": f"responded but rcode={parsed['rcode']} answers={parsed['answer_count']}",
+                })
+            else:
+                results.append({"server": server, "working": False, "latency_ms": None, "error": "malformed or mismatched response"})
+        except socket.timeout:
+            results.append({"server": server, "working": False, "latency_ms": None, "error": "timed out"})
+        except OSError as e:
+            results.append({"server": server, "working": False, "latency_ms": None, "error": str(e)})
+        finally:
+            sock.close()
+
+    return {"servers_tested": results, "any_working": any(r["working"] for r in results)}
 
 
 # UPnP IGD (Internet Gateway Device) -- see query_upnp_gateway() below for
@@ -1686,6 +1795,22 @@ def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False, skip_u
             tried = ", ".join(c["target"] for c in internet["checks"])
             print(f"  NOT reachable (tried {tried})")
 
+    dns_resolution = {"servers_tested": [], "any_working": None}
+    if not skip_internet:
+        print("\nChecking DNS resolution (not just configured -- actually tested)...")
+        if dns_servers:
+            dns_resolution = check_dns_resolution(dns_servers)
+            for result in dns_resolution["servers_tested"]:
+                if result["working"]:
+                    print(f"  {result['server']:<15} working ({result['latency_ms']}ms)")
+                else:
+                    print(f"  {result['server']:<15} NOT working ({result['error']})")
+            if internet["reachable"] and not dns_resolution["any_working"]:
+                print("  Internet is reachable but no configured DNS server is resolving names -- "
+                      "this looks like a DNS problem, not a general connectivity problem.")
+        else:
+            print("  No DNS servers were found to test (see the ! line under DNS above).")
+
     upnp_gateway, upnp_errors = {}, []
     if not skip_upnp:
         print("\nChecking router via UPnP (no credentials needed)...")
@@ -1722,6 +1847,7 @@ def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False, skip_u
         "wifi_scan_errors": wifi_errors,
         "channel_recommendation": channel_recommendation,
         "internet": internet,
+        "dns_resolution": dns_resolution,
         "upnp_gateway": upnp_gateway,
         "upnp_errors": upnp_errors,
     }

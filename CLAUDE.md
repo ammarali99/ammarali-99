@@ -70,16 +70,19 @@ internet, and only opportunistically. Nothing else is allowed to make an
 outbound call — that's not a style preference, it's the core offline-first
 constraint.
 
-**One narrow, deliberate exception:** A1's `check_internet_reachability()`
-does a lightweight TCP-connect reachability *test* (not ICMP, no data sent
-beyond the handshake) to a couple of well-known IPs on port 443 — a
-diagnostic check, not a dependency. A1 doesn't need it to succeed for
-anything else it does, and it's skippable with `--no-internet`. This exists
-because the product's whole vision is diagnosing network issues *including*
-when the internet connection itself is the problem, which needs an actual
-check of whether the WAN path is up — that requires this one call, so it's
-a decided carve-out rather than an unnoticed rule break. No other module
-gets this exception.
+**One narrow, deliberate exception, two instances of it:** A1's
+`check_internet_reachability()` does a lightweight TCP-connect reachability
+*test* (not ICMP, no data sent beyond the handshake) to a couple of
+well-known IPs on port 443, and `check_dns_resolution()` sends a raw DNS
+query directly to each configured DNS server to check it actually resolves
+names (catches "internet works but DNS doesn't," which looks identical to
+"internet is down" otherwise). Both are diagnostic checks, not dependencies
+— A1 doesn't need either to succeed for anything else it does, and both are
+skippable together with `--no-internet`. This exists because the product's
+whole vision is diagnosing network issues *including* when the internet
+connection itself is the problem, which needs an actual check of whether
+the WAN path — and DNS specifically — is up. That's a decided carve-out
+rather than an unnoticed rule break. No other module gets this exception.
 
 **Credential Manager** lives locally inside the Core Engine (not the cloud) —
 device/router login credentials, encrypted at rest, never leave the device.
@@ -180,6 +183,18 @@ a non-technical install target later). Current version does:
   "One narrow, deliberate exception" in the Architecture section above.
   TCP-connect test (not ICMP) to a couple of well-known IPs on port 443,
   skippable with `--no-internet`
+- DNS resolution check (`check_dns_resolution()`) — A1's *second*
+  instance of that same exception (still gated under `--no-internet`,
+  not a new flag). Tests whether each *configured* DNS server actually
+  resolves names, by sending it a hand-built raw DNS query directly (the
+  OS resolver can't be pointed at one specific server) — catches
+  "internet is reachable but DNS is broken" (ISP DNS down, hijacked DNS,
+  captive portal), which looks identical to "internet is down" to a
+  non-technical user but has a completely different fix. Verified with a
+  real successful query against a real DNS server; the failure/timeout
+  path is **not verified** — this sandbox transparently intercepts
+  outbound DNS the same way it intercepts outbound TCP, so a query to a
+  non-existent server still returned a fake success
 - Router WAN info via UPnP IGD (`query_upnp_gateway()`) — external IP,
   connection status, uptime, and (best-effort, **not yet verified on real
   hardware**) traffic byte counters, via SSDP discovery + SOAP calls to
