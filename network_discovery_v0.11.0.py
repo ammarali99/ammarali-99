@@ -3,8 +3,38 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.10.0
+VERSION: 0.11.0
 CHANGELOG:
+  0.11.0 - check_firewall_rules() only ever checked DNS (port 53) and
+          ICMP -- too narrow. A firewall rule silently dropping HTTP or
+          HTTPS looks identical to "internet is down" but never got
+          flagged, and a rule blocking DHCP is arguably the single most
+          foundational way to break connectivity (no IP, no gateway, no
+          DNS server -- nothing works), also never flagged. Replaced the
+          single hardcoded DNS-port check with a small, named table,
+          _CONNECTIVITY_PORTS: DNS (53, tcp/udp), HTTP (80, tcp), HTTPS
+          (443, tcp/udp -- udp for HTTP/3-QUIC, increasingly common),
+          DHCP server (67, udp), DHCP client (68, udp). Each suspect rule
+          now carries a "service" label (e.g. "HTTPS") instead of just a
+          bare port number, for plain-language findings later.
+
+          Deliberately still a small, curated set, not "every port" --
+          the whole point of only returning DNS/ICMP-matching rules in
+          v0.10.0 was to avoid dumping the full ruleset on A2/downstream;
+          widening that to every possible port would mean flagging a
+          customer's legitimate custom rule (blocking some unrelated
+          app's port) as if it explains a connectivity problem it has
+          nothing to do with. Every port in this table maps to a symptom
+          A1/A2 can already detect and correlate against: DNS -> DNS not
+          resolving, HTTP/HTTPS -> internet unreachable (A1's own
+          reachability check tests port 443 specifically), DHCP -> no
+          gateway found at all. That correlation logic lives in A2's
+          check_firewall_blocking() (a2_rule_engine v0.5.0) -- A1 still
+          only gathers, it doesn't decide anything matters.
+
+          Re-verified against this sandbox's real iptables (rules for
+          udp/53, tcp/80, tcp/443, and icmp all correctly caught; an
+          unrelated tcp/8080 rule still correctly ignored).
   0.10.0 - check_firewall_rules(): reads the actual local firewall
           ruleset (netsh advfirewall on Windows, iptables/nft on Linux,
           pfctl on macOS) for any rule that blocks DNS (port 53) or ICMP
@@ -182,10 +212,10 @@ CHANGELOG:
 
 Standard-library only. No pip installs, on purpose -- see CLAUDE.md for why.
 
-Run it directly:  python3 network_discovery_v0.10.0.py
-Skip the slow steps while testing:  python3 network_discovery_v0.10.0.py --no-ports --no-wifi
-Stay fully offline, no exceptions: python3 network_discovery_v0.10.0.py --no-internet
-Dump machine-readable output:       python3 network_discovery_v0.10.0.py --json out.json
+Run it directly:  python3 network_discovery_v0.11.0.py
+Skip the slow steps while testing:  python3 network_discovery_v0.11.0.py --no-ports --no-wifi
+Stay fully offline, no exceptions: python3 network_discovery_v0.11.0.py --no-internet
+Dump machine-readable output:       python3 network_discovery_v0.11.0.py --json out.json
 
 Note on Wi-Fi scanning permissions: on Linux, actually triggering a scan
 (as opposed to reading a cached list) usually needs root. If you see a
@@ -1011,10 +1041,22 @@ def check_dns_resolution(dns_servers=None, timeout=2.0):
     return {"servers_tested": results, "any_working": any(r["working"] for r in results)}
 
 
-# Firewall rule scanning -- see check_firewall_rules() below. Only cares
-# about rules that could plausibly block DNS or ICMP; not a full ruleset
-# dump.
-_FIREWALL_DNS_PORT = 53
+# Firewall rule scanning -- see check_firewall_rules() below. Deliberately
+# a small, named table, not "every port": each one maps to a symptom
+# A1/A2 can already detect and correlate against (see A2's
+# check_firewall_blocking()) -- DNS -> DNS not resolving, HTTP/HTTPS ->
+# internet unreachable (check_internet_reachability() itself tests port
+# 443), DHCP -> no gateway found at all. Widening this to every possible
+# port would mean flagging a customer's legitimate custom rule (blocking
+# some unrelated app's port) as if it explains a connectivity problem it
+# has nothing to do with.
+_CONNECTIVITY_PORTS = {
+    53: ("DNS", {"tcp", "udp"}),
+    80: ("HTTP", {"tcp"}),
+    443: ("HTTPS", {"tcp", "udp"}),  # udp covers HTTP/3 (QUIC)
+    67: ("DHCP (server)", {"udp"}),
+    68: ("DHCP (client)", {"udp"}),
+}
 
 
 def _port_matches(port_field, port):
@@ -1045,11 +1087,24 @@ def _port_matches(port_field, port):
     return False
 
 
+def _matched_connectivity_service(port_field, protocol):
+    """
+    Checks a rule's port field against every port in _CONNECTIVITY_PORTS
+    for the given protocol, returning (port, service_name) for the first
+    match, or (None, None). A rule's port field can be a single port, a
+    comma list, or a range -- _port_matches() already handles all three.
+    """
+    for port, (service, protocols) in _CONNECTIVITY_PORTS.items():
+        if protocol in protocols and _port_matches(port_field, port):
+            return port, service
+    return None, None
+
+
 def _firewall_windows(errors):
     """
     Parses `netsh advfirewall firewall show rule name=all` into per-rule
     blocks, then keeps only the enabled Block rules whose protocol/port
-    match DNS (TCP or UDP port 53) or ICMP. Reading rules this way
+    match one of _CONNECTIVITY_PORTS, or ICMP. Reading rules this way
     doesn't need elevation on Windows, unlike the Linux/macOS paths.
     """
     try:
@@ -1091,13 +1146,16 @@ def _firewall_windows(errors):
             continue
         protocol = (r.get("Protocol") or "").lower()
         is_icmp = protocol.startswith("icmpv4") or protocol.startswith("icmpv6") or protocol == "icmp"
-        is_dns = protocol in ("tcp", "udp") and _port_matches(r.get("LocalPort"), _FIREWALL_DNS_PORT)
-        if is_dns or is_icmp:
+        port, service = (None, None)
+        if protocol in ("tcp", "udp"):
+            port, service = _matched_connectivity_service(r.get("LocalPort"), protocol)
+        if service or is_icmp:
             suspects.append({
                 "name": r.get("name", "unnamed rule"),
                 "direction": (r.get("Direction") or "").lower() or None,
                 "protocol": "icmp" if is_icmp else protocol,
-                "port": _FIREWALL_DNS_PORT if is_dns else None,
+                "port": port,
+                "service": "ICMP" if is_icmp else service,
                 "action": "block",
             })
     return suspects
@@ -1113,11 +1171,12 @@ _IPTABLES_PROTO_NUMBERS = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6"}
 
 def _firewall_linux_iptables(errors):
     """
-    Parses `iptables -L -n` for DROP/REJECT rules matching DNS or ICMP.
-    Returns None (not []) on any failure to read the ruleset at all, so
-    the caller can fall back to nft -- an empty list means "read the
-    ruleset successfully, found nothing matching," a real and useful
-    result that shouldn't trigger a fallback.
+    Parses `iptables -L -n` for DROP/REJECT rules matching a port in
+    _CONNECTIVITY_PORTS, or ICMP. Returns None (not []) on any failure to
+    read the ruleset at all, so the caller can fall back to nft -- an
+    empty list means "read the ruleset successfully, found nothing
+    matching," a real and useful result that shouldn't trigger a
+    fallback.
     """
     try:
         result = subprocess.run(["iptables", "-L", "-n"], capture_output=True, text=True, timeout=10)
@@ -1147,14 +1206,21 @@ def _firewall_linux_iptables(errors):
         target, raw_proto = parts[0], parts[1]
         proto = _IPTABLES_PROTO_NUMBERS.get(raw_proto, raw_proto)
         is_icmp = proto in ("icmp", "icmpv6")
-        port_m = re.search(r"dpt:(\d+)", line)
-        is_dns = proto in ("tcp", "udp") and bool(port_m) and int(port_m.group(1)) == _FIREWALL_DNS_PORT
-        if is_dns or is_icmp:
+        port, service = (None, None)
+        if proto in ("tcp", "udp"):
+            port_m = re.search(r"dpt:(\d+)", line)
+            if port_m:
+                candidate = int(port_m.group(1))
+                entry = _CONNECTIVITY_PORTS.get(candidate)
+                if entry and proto in entry[1]:
+                    port, service = candidate, entry[0]
+        if service or is_icmp:
             suspects.append({
                 "name": f"{chain or '?'} chain: {target} {proto}",
                 "direction": {"INPUT": "in", "OUTPUT": "out", "FORWARD": "forward"}.get(chain, chain),
                 "protocol": "icmp" if is_icmp else proto,
-                "port": _FIREWALL_DNS_PORT if is_dns else None,
+                "port": port,
+                "service": "ICMP" if is_icmp else service,
                 "action": target.lower(),
             })
     return suspects
@@ -1164,9 +1230,9 @@ def _firewall_linux_nft(errors):
     """
     Fallback for nftables-only systems (no iptables shim installed).
     Coarse line-based parsing, not a full nft grammar parser -- looks for
-    drop/reject lines that also mention ICMP or a DNS-port match, same
-    "good enough, report clearly when it isn't" approach as the rest of
-    this file's OS-tool parsing.
+    drop/reject lines that also mention ICMP or a _CONNECTIVITY_PORTS
+    match, same "good enough, report clearly when it isn't" approach as
+    the rest of this file's OS-tool parsing.
     """
     try:
         result = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True, timeout=10)
@@ -1189,24 +1255,30 @@ def _firewall_linux_nft(errors):
         if not re.search(r"\b(drop|reject)\b", stripped, re.IGNORECASE):
             continue
         is_icmp = re.search(r"\bicmpx?(v6)?\b", stripped, re.IGNORECASE) is not None
+        proto = "udp" if "udp" in stripped.lower() else "tcp" if "tcp" in stripped.lower() else "unknown"
+        port, service = (None, None)
         port_m = re.search(r"dport\s+(\d+)", stripped)
-        is_dns = bool(port_m) and int(port_m.group(1)) == _FIREWALL_DNS_PORT
-        if is_dns or is_icmp:
-            proto = "udp" if "udp" in stripped.lower() else "tcp" if "tcp" in stripped.lower() else "unknown"
+        if port_m and proto in ("tcp", "udp"):
+            candidate = int(port_m.group(1))
+            entry = _CONNECTIVITY_PORTS.get(candidate)
+            if entry and proto in entry[1]:
+                port, service = candidate, entry[0]
+        if service or is_icmp:
             suspects.append({
                 "name": stripped,
                 "direction": None,
                 "protocol": "icmp" if is_icmp else proto,
-                "port": _FIREWALL_DNS_PORT if is_dns else None,
+                "port": port,
+                "service": "ICMP" if is_icmp else service,
                 "action": "drop" if re.search(r"\bdrop\b", stripped, re.IGNORECASE) else "reject",
             })
     return suspects
 
 
 def _firewall_macos(errors):
-    """Parses `pfctl -sr` for block rules matching DNS or ICMP. Needs
-    root -- pfctl's own error message says so plainly, so that's passed
-    through rather than guessed at."""
+    """Parses `pfctl -sr` for block rules matching a port in
+    _CONNECTIVITY_PORTS, or ICMP. Needs root -- pfctl's own error message
+    says so plainly, so that's passed through rather than guessed at."""
     try:
         result = subprocess.run(["pfctl", "-sr"], capture_output=True, text=True, timeout=10)
     except FileNotFoundError:
@@ -1229,15 +1301,22 @@ def _firewall_macos(errors):
             continue
         lower = stripped.lower()
         is_icmp = "icmp" in lower
+        proto = "udp" if "udp" in lower else "tcp" if "tcp" in lower else None
+        port, service = (None, None)
         port_m = re.search(r"port\s*=?\s*(\d+)", lower)
-        is_dns = bool(port_m) and int(port_m.group(1)) == _FIREWALL_DNS_PORT and ("udp" in lower or "tcp" in lower)
-        if is_dns or is_icmp:
+        if port_m and proto:
+            candidate = int(port_m.group(1))
+            entry = _CONNECTIVITY_PORTS.get(candidate)
+            if entry and proto in entry[1]:
+                port, service = candidate, entry[0]
+        if service or is_icmp:
             direction = "in" if re.search(r"\bin\b", lower) else "out" if re.search(r"\bout\b", lower) else None
             suspects.append({
                 "name": stripped,
                 "direction": direction,
-                "protocol": "icmp" if is_icmp else ("udp" if "udp" in lower else "tcp"),
-                "port": _FIREWALL_DNS_PORT if is_dns else None,
+                "protocol": "icmp" if is_icmp else proto,
+                "port": port,
+                "service": "ICMP" if is_icmp else service,
                 "action": "block",
             })
     return suspects
@@ -1245,15 +1324,18 @@ def _firewall_macos(errors):
 
 def check_firewall_rules():
     """
-    Reads the actual local firewall ruleset for any rule that blocks DNS
-    (port 53) or ICMP specifically. Pure data gathering, same as every
-    other function in this file -- this reports what rules exist, it
-    doesn't decide whether one of them explains a connectivity problem.
-    A2's check_firewall_blocking() is what correlates a matching rule
-    against an actual DNS/internet failure and calls it a likely cause.
+    Reads the actual local firewall ruleset for any rule that blocks one
+    of _CONNECTIVITY_PORTS (DNS, HTTP, HTTPS, DHCP) or ICMP specifically.
+    Pure data gathering, same as every other function in this file --
+    this reports what rules exist, it doesn't decide whether one of them
+    explains a connectivity problem. A2's check_firewall_blocking() is
+    what correlates a matching rule against an actual failure and calls
+    it a likely cause.
 
-    Only returns the small subset of rules that block DNS or ICMP, not a
-    full ruleset dump -- nothing downstream needs the rest.
+    Only returns that small, curated subset of rules, not a full ruleset
+    dump -- nothing downstream needs the rest, and a wider net would mean
+    flagging a customer's legitimate custom rule as if it were the cause
+    of a problem it has nothing to do with.
 
     Known limitation: reading the full ruleset needs root on Linux
     (iptables/nft) and macOS (pfctl). Without it, the errors list
@@ -2118,15 +2200,15 @@ def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False, skip_u
 
     firewall_rules, firewall_errors = [], []
     if not skip_firewall:
-        print("\nChecking local firewall rules for DNS/ICMP blocks...")
+        print("\nChecking local firewall rules for DNS/HTTP/HTTPS/DHCP/ICMP blocks...")
         firewall_rules, firewall_errors = check_firewall_rules()
         for err in firewall_errors:
             print(f"  ! {err}")
         if firewall_rules:
             for r in firewall_rules:
-                print(f"  ! {r['name']} blocks {r['protocol']}" + (f" port {r['port']}" if r["port"] else ""))
+                print(f"  ! {r['name']} blocks {r['service']}" + (f" (port {r['port']})" if r["port"] else ""))
         elif not firewall_errors:
-            print("  No rules blocking DNS or ICMP found.")
+            print("  No rules blocking DNS/HTTP/HTTPS/DHCP/ICMP found.")
 
     upnp_gateway, upnp_errors = {}, []
     if not skip_upnp:

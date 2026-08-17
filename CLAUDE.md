@@ -216,30 +216,37 @@ a non-technical install target later). Current version does:
   language instead of printed as if they were real data
 - Local firewall rule scan (`check_firewall_rules()`) — reads the actual
   firewall ruleset (`netsh advfirewall` on Windows, `iptables`/`nft` on
-  Linux, `pfctl` on macOS) for any rule that blocks DNS (port 53) or ICMP
-  specifically. Pure data gathering, no verdict attached — A2's
-  `check_firewall_blocking()` is what decides a matching rule actually
-  explains a connectivity failure (see A2's current-state entry below;
-  this is the same A1-gathers/A2-decides split as everything else in the
-  architecture). Only returns the small subset of rules that block
-  DNS/ICMP, not a full ruleset dump. **Known limitation:** reading the
-  full ruleset needs root on Linux/macOS (Windows' `netsh advfirewall`
-  doesn't need elevation) — without it, the errors list says so instead
-  of silently reporting "no blocking rules found." Verified against a
-  real ruleset in this sandbox: caught a real parsing gap along the way
-  — `iptables -L -n` printed protocol *numbers* (17, 1) instead of names
-  (udp, icmp) here despite a populated `/etc/protocols`, which the
-  parser now maps back to names instead of silently missing the rule.
-  Windows/macOS parsing is **not yet verified on real hardware**.
-  Skippable with `--no-firewall`
+  Linux, `pfctl` on macOS) for any rule that blocks one of a small,
+  named set of connectivity-relevant ports (v0.11.0): DNS (53), HTTP
+  (80), HTTPS (443, including UDP for HTTP/3-QUIC), DHCP server/client
+  (67/68), plus ICMP. Deliberately not "every port" — each one maps to a
+  symptom A1/A2 can already detect and correlate against (see A2's
+  `check_firewall_blocking()` below); a wider net would mean flagging a
+  customer's legitimate custom rule as if it explained a problem it has
+  nothing to do with. Pure data gathering, no verdict attached — A2 is
+  what decides a matching rule actually explains a connectivity failure
+  (same A1-gathers/A2-decides split as everything else in the
+  architecture). Only returns that small subset of rules, not a full
+  ruleset dump. **Known limitation:** reading the full ruleset needs
+  root on Linux/macOS (Windows' `netsh advfirewall` doesn't need
+  elevation) — without it, the errors list says so instead of silently
+  reporting "no blocking rules found." Verified against a real ruleset
+  in this sandbox: caught a real parsing gap along the way — `iptables
+  -L -n` printed protocol *numbers* (17, 1) instead of names (udp,
+  icmp) here despite a populated `/etc/protocols`, which the parser now
+  maps back to names instead of silently missing the rule. Re-verified
+  after the port-set widening (rules for udp/53, tcp/80, tcp/443,
+  udp/67, and icmp all correctly caught; an unrelated tcp/8080 rule
+  still correctly ignored). Windows/macOS parsing is **not yet verified
+  on real hardware**. Skippable with `--no-firewall`
 - JSON export (`--json`) in the shape that will eventually be handed to A6
   directly instead of a file
 - `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` /
   `--no-firewall` flags to skip slower or internet/LAN-broadcast-touching
   steps
 
-**A2 (Rule Engine) is started (v0.4.0).** Standard-library-only Python,
-in its own file (`a2_rule_engine_v0.4.0.py`), deliberately never importing
+**A2 (Rule Engine) is started (v0.5.0).** Standard-library-only Python,
+in its own file (`a2_rule_engine_v0.5.0.py`), deliberately never importing
 A1's file directly -- it reads the same dict A1's `--json` export produces
 (file-based handoff: A1 writes `--json scan.json`, A2 reads `--input
 scan.json`), so A1 can keep bumping its own version/filename with zero
@@ -322,11 +329,33 @@ changes needed in A2. Current version does:
   correlation cases (DNS-broken, internet-broken, rule-present-but-
   nothing-actually-wrong -- confirmed the last one correctly produces no
   finding).
+- **Widened rule (v0.5.0): per-service firewall correlation, not one
+  blanket gate.** A1 v0.11.0 widened `check_firewall_rules()` to a small
+  named set of connectivity-relevant ports (DNS, HTTP, HTTPS, DHCP
+  client/server) alongside ICMP -- see A1's entry above. The old v0.4.0
+  blanket "DNS broken OR internet broken" gate was actually imprecise
+  even for the original DNS/ICMP-only set: it would have credited an
+  ICMP-blocking rule for "the internet is unreachable" even though
+  `check_internet_reachability()` never uses ICMP at all (TCP connect
+  only). Rewritten so each service correlates against the specific
+  symptom it would actually cause: DNS against
+  `check_dns_not_resolving()`'s own trigger, HTTPS against
+  `check_internet_reachability()`'s (a direct match -- that check's own
+  test is a TCP connect to port 443), ICMP against
+  `check_gateway_latency()`'s 100%-loss trigger (ICMP is what ping
+  uses), DHCP against `check_gateway_missing()`'s (no DHCP means no
+  IP/gateway/DNS server in the first place). HTTP (port 80) is gathered
+  by A1 but deliberately never correlated -- no existing A1 check tests
+  port 80, so there's no symptom to attach it to yet; a stated gap, not
+  a guessed-at one. Tested against all four now-correlated services with
+  both matching and deliberately-mismatched connectivity contexts (e.g.
+  an ICMP-blocking rule present while the gateway is actually fine --
+  confirmed no finding).
 - Tested end-to-end against this file's own A1 output, synthetic data
   covering every rule, and Ammar's first real hardware scan (which is what
   surfaced the v0.2.0 fix) -- next up: run the current version against
-  real hardware again to confirm the v0.2.0, v0.3.0, and v0.4.0 changes,
-  then expand the rule set further
+  real hardware again to confirm the v0.2.0 through v0.5.0 changes, then
+  expand the rule set further
 
 **Note: the A1-to-A2 JSON file handoff is temporary, not the final
 design.** A1 and A2 currently pass data through a JSON file

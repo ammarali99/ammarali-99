@@ -3,8 +3,35 @@
 a2_rule_engine.py -- Module A2 (Rule Engine) of the offline network
 diagnostic app.
 
-VERSION: 0.4.0
+VERSION: 0.5.0
 CHANGELOG:
+  0.5.0 - A1 v0.11.0 widened check_firewall_rules() from DNS/ICMP-only to
+          a small named set of connectivity-relevant ports (DNS, HTTP,
+          HTTPS, DHCP client/server). check_firewall_blocking() rewritten
+          to match: instead of one "DNS broken OR internet broken" gate
+          for every rule, each service now correlates against the
+          specific symptom it would actually cause -- DNS against
+          check_dns_not_resolving's own trigger, HTTPS against
+          check_internet_reachability's (its test is a TCP connect to
+          port 443 specifically, a direct match), ICMP against
+          check_gateway_latency's 100%-loss trigger (ICMP is what ping
+          uses -- a blocked ICMP rule shows up as an unreachable gateway,
+          not a generic "no internet"), DHCP against
+          check_gateway_missing's (no DHCP means no IP/gateway/DNS server
+          in the first place). HTTP (port 80) is gathered by A1 but
+          deliberately never correlated -- no existing A1 check tests
+          port 80, so there's no symptom to attach it to; a known,
+          stated gap rather than a guessed-at one.
+
+          This replaces the old blanket gate specifically because it was
+          imprecise: the original design would have credited an ICMP
+          block for "the internet is unreachable" even though A1's own
+          reachability test doesn't use ICMP at all (TCP connect only,
+          see check_internet_reachability()) -- a real rule blocking
+          ping could sit there unconnected to the actual cause of an
+          outage. Tested against all four now-correlated services (DNS,
+          HTTPS, ICMP, DHCP) with matching and non-matching connectivity
+          contexts, confirming each only fires against its real symptom.
   0.4.0 - A1 v0.10.0 added check_firewall_rules() -- the actual local
           firewall ruleset, filtered down to rules that block DNS (port
           53) or ICMP. Added check_firewall_blocking(): correlates that
@@ -106,8 +133,8 @@ CHANGELOG:
 Standard-library only. No pip installs, same reason as A1 -- see CLAUDE.md.
 
 Run it against a saved scan:
-    python3 network_discovery_v0.10.0.py --json scan.json
-    python3 a2_rule_engine_v0.4.0.py --input scan.json
+    python3 network_discovery_v0.11.0.py --json scan.json
+    python3 a2_rule_engine_v0.5.0.py --input scan.json
 
 Note: this has to be a two-step, file-based handoff, not a direct pipe.
 A1's `--json` with no path still prints its normal plain-language output
@@ -116,7 +143,7 @@ A2 hands it a mix of prose and JSON, not valid JSON on its own. Always
 give A1 a real path (`--json scan.json`) when the output is meant for A2.
 
 Dump findings as JSON instead of/alongside the plain-language printout:
-    python3 a2_rule_engine_v0.4.0.py --input scan.json --json findings.json
+    python3 a2_rule_engine_v0.5.0.py --input scan.json --json findings.json
 """
 
 import argparse
@@ -465,19 +492,34 @@ def check_dns_not_resolving(data):
 
 def check_firewall_blocking(data):
     """
-    Correlates A1's firewall rule scan against the connectivity findings
-    other rules already compute: if DNS isn't resolving or the internet
-    is unreachable, AND a local firewall rule blocks DNS (port 53) or
-    ICMP specifically, that's a far more actionable diagnosis than a bare
-    "DNS isn't resolving" -- this is A2's job (decide from A1's
-    structured data), not A1's (which only reports what rules exist, no
-    verdict). One finding per matching rule.
+    Correlates A1's firewall rule scan against whichever connectivity
+    symptom the blocked service would actually explain -- not one
+    blanket "something's broken" gate for every service, since a rule
+    blocking ICMP shouldn't get blamed for "no internet" when the real
+    cause was something else (or vice versa):
 
-    Severity matches whichever problem it's explaining -- critical if
-    the internet itself is unreachable (same severity as
-    check_internet_reachability's own finding for that state), warning
-    if only DNS is broken (same as check_dns_not_resolving's) -- rather
-    than inventing a third severity scale for the same underlying issue.
+      - DNS blocked   -> only fires if DNS itself isn't resolving
+        (check_dns_not_resolving's own trigger).
+      - HTTPS blocked -> only fires if the internet is confirmed
+        unreachable. check_internet_reachability()'s own test is a TCP
+        connect to port 443 specifically, so this is a direct match, not
+        an inferred one.
+      - ICMP blocked  -> only fires if the gateway itself is unreachable
+        by ping (check_gateway_latency's 100%-loss trigger) -- ICMP is
+        what ping uses, so that's the actual symptom a blocked ICMP rule
+        would cause, not a generic "internet unreachable."
+      - DHCP blocked  -> only fires if no gateway was found at all
+        (check_gateway_missing's own trigger) -- without DHCP a device
+        never gets an IP, gateway, or DNS server in the first place, so
+        "no gateway" is the real symptom, not "DNS broken" or "internet
+        unreachable" downstream of it.
+      - HTTP blocked  -> never correlated today. A1 doesn't test port 80
+        anywhere, so there's no symptom to attach this to yet -- a known
+        gap, not a bug. A1 still gathers it in case a future check needs
+        it.
+
+    One finding per matching rule; severity matches whatever it's
+    explaining rather than a scale of its own.
     """
     suspects = data.get("firewall_rules") or []
     if not suspects:
@@ -485,30 +527,45 @@ def check_firewall_blocking(data):
 
     internet = data.get("internet") or {}
     dns_res = data.get("dns_resolution") or {}
+    gateway_latency = data.get("gateway_latency") or {}
+
     dns_broken = internet.get("reachable") is True and dns_res.get("any_working") is False
     internet_broken = internet.get("reachable") is False
-
-    if not (dns_broken or internet_broken):
-        return []
-
-    severity = SEV_CRITICAL if internet_broken else SEV_WARNING
-    context = "the internet is unreachable" if internet_broken else "DNS isn't resolving"
+    gateway_unreachable = gateway_latency.get("loss_percent") == 100
+    gateway_missing = not data.get("gateway")
 
     findings = []
     for rule in suspects:
-        protocol = rule.get("protocol", "")
-        is_dns_rule = protocol in ("tcp", "udp") and rule.get("port") == 53
-        is_icmp_rule = protocol.startswith("icmp")
-        if not (is_dns_rule or is_icmp_rule):
+        service = rule.get("service", "")
+        if service == "DNS":
+            if not dns_broken:
+                continue
+            severity, context = SEV_WARNING, "DNS isn't resolving"
+        elif service == "HTTPS":
+            if not internet_broken:
+                continue
+            severity, context = SEV_CRITICAL, "the internet is unreachable"
+        elif service == "ICMP":
+            if not gateway_unreachable:
+                continue
+            severity, context = SEV_CRITICAL, "the router isn't responding to pings"
+        elif service in ("DHCP (server)", "DHCP (client)"):
+            if not gateway_missing:
+                continue
+            severity, context = SEV_CRITICAL, "no gateway/router could be found"
+        else:
+            # HTTP and anything else A1 gathers but has no correlated
+            # symptom for yet -- not flagged, to avoid false attribution.
             continue
-        target_desc = "DNS (port 53)" if is_dns_rule else "ICMP"
+
         findings.append(make_finding(
-            rule_id="firewall_blocking_dns_or_icmp", category="security", severity=severity,
+            rule_id="firewall_blocking_connectivity", category="security", severity=severity,
             target=rule.get("name", "firewall rule"),
-            summary=(f"A local firewall rule ({rule.get('name', 'unnamed')}) blocks {target_desc} "
+            summary=(f"A local firewall rule ({rule.get('name', 'unnamed')}) blocks {service} "
                      f"-- likely why {context}."),
             detail=str(rule), fix_classification=FIX_GUIDED,
-            evidence={"firewall_rule": rule, "internet": internet, "dns_resolution": dns_res},
+            evidence={"firewall_rule": rule, "internet": internet, "dns_resolution": dns_res,
+                      "gateway_latency": gateway_latency, "gateway": data.get("gateway")},
         ))
     return findings
 
