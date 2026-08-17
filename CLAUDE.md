@@ -387,17 +387,67 @@ changes needed in A2. Current version does:
   real hardware again to confirm the v0.2.0 through v0.6.0 changes, then
   expand the rule set further
 
-**Note: the A1-to-A2 JSON file handoff is temporary, not the final
-design.** A1 and A2 currently pass data through a JSON file
-(`--json scan.json` / `--input scan.json`) because A6 (the encrypted local
-cache) doesn't exist yet. Once A6 is built, this gets fixed: both A1 and
-A2 write/read through A6 directly instead of a JSON file, matching the
-architecture's real rule that every module writes to A6 first. This is a
-small plumbing change, not a rewrite -- A2's Finding schema is already
-designed to be the exact row shape A6 will store, so only the storage
-call changes (`json.dump()` -> `a6.write_findings()`), not the rule logic.
+**A6 (Encrypted local cache) is started (v0.1.0).** Own file
+(`a6_encrypted_cache_v0.1.0.py`). Handles the two things that actually
+exist so far -- A1 scans and A2 findings -- rather than pre-building
+tables for fix_outcomes/snapshots/AI suggestions/reports before A3/A4/AI1/
+A5 exist to write them. Current version does:
 
-Everything else (A3 through A7) is not started yet.
+- SQLite for storage, `cryptography` (Fernet/AES-128-CBC+HMAC) for
+  encryption at rest -- Python's standard library has no safe symmetric
+  cipher, and hand-rolling one for a database meant to eventually hold
+  router credentials was the wrong place to save a dependency. This is a
+  **deliberate, flagged exception** to the standard-library-only
+  convention, approved by Ammar: `cryptography` is a build-time
+  dependency that ships bundled inside the final installer, so it costs
+  nothing in install friction for the non-technical end user, only in
+  dev setup now.
+- **Not every column is encrypted.** `finding_id` / `rule_id` /
+  `category` / `severity` / `fix_classification` / `detected_at` /
+  `source_version` / `scanned_at` stay in the clear, since A3 and AI1
+  will need to filter and join on exactly those later (e.g. "every
+  auto-fixable finding," or trend a `finding_id` across scans) without
+  decrypting every row to check a severity level, and none of them
+  reveal anything about the customer's network. Everything that could --
+  the full A1 discovery dict, and a finding's `target`/`summary`/
+  `detail`/`evidence` -- goes into one encrypted BLOB column per row.
+  Verified: imported a real A1 scan + A2 finding (a missing-gateway
+  critical) from this session's sandbox network, round-tripped both back
+  out correctly, then grepped the raw `.db` file bytes for the scan's
+  real local IP and confirmed it does not appear in plaintext.
+- **Key management is a known, flagged gap for v1.** The Fernet key is a
+  random 32 bytes generated on first run, stored in a sibling file next
+  to the database with owner-only permissions (`chmod 600`) on
+  Linux/macOS. That protects the data if the `.db` file alone leaks or
+  gets copied elsewhere, but **not** against someone with full
+  filesystem access to this machine, since the key sits right next to
+  what it unlocks -- and `chmod 600` is a no-op on Windows (no POSIX
+  permission bits there). Real protection needs OS-keychain integration
+  (DPAPI / Keychain / Secret Service, likely via the `keyring` package)
+  -- deferred rather than bolted on silently, since the Credential
+  Manager will need the same answer and it deserves its own decision.
+- `write_scan()` / `write_findings()` / `get_scans()` / `get_findings()`
+  (filterable by scan/severity/category/fix_classification) as the
+  Python API.
+- CLI is a bridge, not the final design: `--import-scan` / `--import-
+  findings` read A1's/A2's existing `--json` exports, so the whole
+  encrypt/store/retrieve path is testable today without changing A1/A2
+  yet. Also `--list-scans` / `--list-findings` for inspection, and
+  `--selftest` (writes a throwaway scan+finding with a canary string,
+  reads it back, confirms the canary never appears in the raw `.db`
+  bytes) so this module's own correctness doesn't depend on having A1/A2
+  output on hand.
+
+**The A1-to-A2 JSON file handoff (`--json scan.json` / `--input
+scan.json`) is still in place** -- A6 existing doesn't change A1/A2 yet.
+Next step: wire A1's and A2's own CLIs to write through A6 directly
+(`json.dump()` -> `a6.write_scan()`/`a6.write_findings()`), which
+CLAUDE.md's earlier note already called a small plumbing change, not a
+rewrite -- A2's Finding schema was already designed to match A6's row
+shape.
+
+Everything else (A3, A4, A5, A7, the Credential Manager, AI1) is not
+started yet.
 
 ## Flagged / open decisions
 
@@ -445,7 +495,10 @@ Everything else (A3 through A7) is not started yet.
   Python/networking-library familiarity.
 - **Standard-library-only Python** for v1 modules unless there's a specific
   reason to add a dependency — flag it explicitly if you think one's needed,
-  don't just add it.
+  don't just add it. (First exception: A6 uses `cryptography` for
+  encryption at rest — flagged and approved, see A6's current-state entry.
+  It's a build-time dependency bundled into the final installer, so it
+  doesn't add install friction for the end user.)
 - **Versioning:** every file gets a version number in its own filename and a
   short changelog in its header comment (e.g. `network_discovery.py` ->
   `network_discovery_v0.4.0.py` next time it changes, with a `VERSION:` /
@@ -458,10 +511,18 @@ Everything else (A3 through A7) is not started yet.
 
 ## On the horizon
 
+- **Re-test A1 v0.12.0 / A2 v0.6.0 against Ammar's real hardware** — not
+  yet done since the v0.2.0–v0.6.0 changes (severity scaling, DNS-not-
+  resolving, firewall correlation, the "ALL" blanket-block detection)
+  landed. Flagged as the next real-hardware checkpoint before either
+  module grows further.
+- Wire A1's and A2's own CLIs to write through A6 directly instead of the
+  JSON file handoff (small plumbing change, see A6's current-state entry)
 - Expand the MAC vendor OUI table (known gap, flagged above)
 - Add mDNS and SNMP to A1's discovery methods (currently ARP/ping/hostname/
   port-probe/Wi-Fi only)
-- Test A2 against Ammar's real hardware scans, then expand its rule set
+- Expand A2's rule set further, once the real-hardware retest confirms the
+  current rules
 - A4 (Snapshot/Rollback) before A3 (Fix Engine) — rollback has to exist
   before anything is allowed to touch a device's config
 - AI layer (AI1) stays deferred until after a working core (A1-A7 minus AI1)

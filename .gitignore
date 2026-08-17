@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# A6's encrypted cache + key -- local runtime data and a secret, never commit
+*.db
+*.key
