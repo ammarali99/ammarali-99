@@ -3,8 +3,60 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.11.0
+VERSION: 0.12.0
 CHANGELOG:
+  0.12.0 - check_firewall_rules() only ever recognized rules scoped to
+          one of the five named ports -- a rule that blocks everything
+          (no protocol/port restriction at all) matched none of those
+          checks and was silently invisible, even though it's the
+          single most consequential kind of rule there is: it explains
+          every connectivity symptom at once, not just one. Ammar's
+          specific example: a Windows rule blocking all remote ports
+          (Protocol=Any or RemotePort=Any) -- the parser's own first
+          gate, `protocol in ("tcp", "udp")`, rejected it before ever
+          looking at the port field.
+
+          Every platform parser now also recognizes a blanket rule and
+          labels it service "ALL" instead of one of the five named
+          services, since it isn't really the same category as "blocks
+          one specific service" -- it's evidence against every symptom
+          A2 tracks simultaneously:
+            - Windows: an enabled, outbound Block rule with
+              Protocol=Any or RemotePort=Any.
+            - Linux (iptables): a rule with protocol "all" (no -p given),
+              AND separately, a chain's own default policy (`Chain
+              OUTPUT (policy DROP)`) -- a genuinely different mechanism
+              from an individual rule, previously invisible for a
+              second, unrelated reason: the chain-header regex only
+              extracted the chain name, never the policy verdict sitting
+              right next to it.
+            - Linux (nft): a bare `drop`/`reject` statement mentioning
+              neither `dport` nor `icmp`, and separately a chain's
+              `policy drop;`/`policy reject;` line.
+            - macOS (pfctl): a `block` line naming neither `udp` nor
+              `tcp` -- correct pf semantics, not a heuristic guess: pf
+              rules apply to all protocols by default when `proto` is
+              omitted.
+
+          New _windows_firewall_profile_policy(): reads whether the
+          active Windows Firewall profile's default outbound action is
+          Block (`netsh advfirewall show currentprofile`) -- a
+          policy-level setting, not a rule, so _firewall_windows()'s
+          per-rule parsing could never have seen it regardless of the
+          fix above. Surfaced as the same synthetic "ALL" suspect rule
+          if the currently active profile is outbound-block-by-default.
+
+          A2's check_firewall_blocking() (a2_rule_engine v0.6.0) gets a
+          matching "ALL" branch: fires if *any* of the four existing
+          broken conditions is true (not just one), since a blanket
+          block is consistent with all of them regardless of which
+          symptom happens to be visible right now.
+
+          Re-verified against a real iptables ruleset in this sandbox: a
+          bare `-j DROP` rule (no -p) and a chain default policy of DROP
+          are both now caught; the previous five-service detections
+          (udp/53, tcp/80, tcp/443, udp/67, icmp) are unaffected.
+          Windows/macOS paths remain unverified against real hardware.
   0.11.0 - check_firewall_rules() only ever checked DNS (port 53) and
           ICMP -- too narrow. A firewall rule silently dropping HTTP or
           HTTPS looks identical to "internet is down" but never got
@@ -212,10 +264,10 @@ CHANGELOG:
 
 Standard-library only. No pip installs, on purpose -- see CLAUDE.md for why.
 
-Run it directly:  python3 network_discovery_v0.11.0.py
-Skip the slow steps while testing:  python3 network_discovery_v0.11.0.py --no-ports --no-wifi
-Stay fully offline, no exceptions: python3 network_discovery_v0.11.0.py --no-internet
-Dump machine-readable output:       python3 network_discovery_v0.11.0.py --json out.json
+Run it directly:  python3 network_discovery_v0.12.0.py
+Skip the slow steps while testing:  python3 network_discovery_v0.12.0.py --no-ports --no-wifi
+Stay fully offline, no exceptions: python3 network_discovery_v0.12.0.py --no-internet
+Dump machine-readable output:       python3 network_discovery_v0.12.0.py --json out.json
 
 Note on Wi-Fi scanning permissions: on Linux, actually triggering a scan
 (as opposed to reading a cached list) usually needs root. If you see a
@@ -1104,8 +1156,13 @@ def _firewall_windows(errors):
     """
     Parses `netsh advfirewall firewall show rule name=all` into per-rule
     blocks, then keeps only the enabled Block rules whose protocol/port
-    match one of _CONNECTIVITY_PORTS, or ICMP. Reading rules this way
-    doesn't need elevation on Windows, unlike the Linux/macOS paths.
+    match one of _CONNECTIVITY_PORTS, ICMP, or a blanket "blocks all
+    remote ports" rule (Protocol=Any or RemotePort=Any, outbound --
+    service "ALL"). A blanket rule doesn't map to one connectivity
+    service; it's evidence against all of them at once, so it's kept in
+    a separate category rather than forced into the five-service table.
+    Reading rules this way doesn't need elevation on Windows, unlike the
+    Linux/macOS paths.
     """
     try:
         result = subprocess.run(
@@ -1145,14 +1202,20 @@ def _firewall_windows(errors):
         if r.get("Enabled") != "Yes" or r.get("Action") != "Block":
             continue
         protocol = (r.get("Protocol") or "").lower()
+        direction = (r.get("Direction") or "").lower()
         is_icmp = protocol.startswith("icmpv4") or protocol.startswith("icmpv6") or protocol == "icmp"
+        is_blanket = direction == "out" and (
+            protocol == "any" or (r.get("RemotePort") or "").strip().lower() == "any"
+        )
         port, service = (None, None)
-        if protocol in ("tcp", "udp"):
+        if is_blanket:
+            service = "ALL"
+        elif protocol in ("tcp", "udp"):
             port, service = _matched_connectivity_service(r.get("LocalPort"), protocol)
         if service or is_icmp:
             suspects.append({
                 "name": r.get("name", "unnamed rule"),
-                "direction": (r.get("Direction") or "").lower() or None,
+                "direction": direction or None,
                 "protocol": "icmp" if is_icmp else protocol,
                 "port": port,
                 "service": "ICMP" if is_icmp else service,
@@ -1161,22 +1224,67 @@ def _firewall_windows(errors):
     return suspects
 
 
-# iptables normally prints protocol names (udp/tcp/icmp), but on at
+def _windows_firewall_profile_policy(errors):
+    """
+    Reads whether the currently active Windows Firewall profile blocks
+    outbound connections by default -- a policy-level setting, not an
+    individual rule, so it's invisible to _firewall_windows()'s per-rule
+    parsing no matter how that's extended. `netsh advfirewall show
+    currentprofile` reports it directly. Returns True/False, or None if
+    it couldn't be read (with the reason in errors).
+    """
+    try:
+        result = subprocess.run(
+            ["netsh", "advfirewall", "show", "currentprofile"],
+            capture_output=True, text=True, errors="ignore", timeout=10,
+        )
+    except FileNotFoundError:
+        errors.append("netsh not found (unexpected on Windows)")
+        return None
+    except subprocess.TimeoutExpired:
+        errors.append("netsh advfirewall show currentprofile timed out")
+        return None
+    if result.returncode != 0:
+        errors.append(f"netsh advfirewall show currentprofile failed: {(result.stderr or result.stdout).strip()}")
+        return None
+
+    m = re.search(r"Outbound connections\s*:\s*(\w+)", result.stdout, re.IGNORECASE)
+    if not m:
+        errors.append(
+            "netsh advfirewall show currentprofile ran but no \"Outbound connections\" "
+            "setting was found -- output may not match the expected format"
+        )
+        return None
+    return m.group(1).strip().lower() == "block"
+
+
+# iptables normally prints protocol names (udp/tcp/icmp/all), but on at
 # least one real system tested against (a minimal container, despite a
 # populated /etc/protocols) it printed raw protocol numbers instead --
 # caught by testing against a real ruleset, not assumed. Mapped here so
 # parsing doesn't silently miss rules just because of that difference.
-_IPTABLES_PROTO_NUMBERS = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6"}
+# "0" is the kernel's IPPROTO_IP sentinel, which is what a rule with no
+# -p at all shows as here -- caught the same way, by testing a real
+# unrestricted rule and seeing "0" instead of the expected "all".
+_IPTABLES_PROTO_NUMBERS = {"0": "all", "1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6"}
 
 
 def _firewall_linux_iptables(errors):
     """
     Parses `iptables -L -n` for DROP/REJECT rules matching a port in
-    _CONNECTIVITY_PORTS, or ICMP. Returns None (not []) on any failure to
-    read the ruleset at all, so the caller can fall back to nft -- an
-    empty list means "read the ruleset successfully, found nothing
-    matching," a real and useful result that shouldn't trigger a
-    fallback.
+    _CONNECTIVITY_PORTS, ICMP, or a blanket rule (no -p given, shows as
+    protocol "all") -- service "ALL", same reasoning as the Windows
+    blanket case: it isn't one connectivity service, it's evidence
+    against all of them. Also recognizes a chain's own default policy
+    (`Chain OUTPUT (policy DROP)`) as its own "ALL" suspect -- a
+    genuinely different mechanism from an individual rule, previously
+    invisible because the chain-header regex only ever captured the
+    chain name, never the policy verdict next to it.
+
+    Returns None (not []) on any failure to read the ruleset at all, so
+    the caller can fall back to nft -- an empty list means "read the
+    ruleset successfully, found nothing matching," a real and useful
+    result that shouldn't trigger a fallback.
     """
     try:
         result = subprocess.run(["iptables", "-L", "-n"], capture_output=True, text=True, timeout=10)
@@ -1196,9 +1304,19 @@ def _firewall_linux_iptables(errors):
     suspects = []
     chain = None
     for line in result.stdout.splitlines():
-        chain_m = re.match(r"^Chain (\S+)", line)
+        chain_m = re.match(r"^Chain (\S+)(?:\s*\(policy (\w+)\))?", line)
         if chain_m:
             chain = chain_m.group(1)
+            policy = chain_m.group(2)
+            if policy in ("DROP", "REJECT") and chain in ("INPUT", "OUTPUT"):
+                suspects.append({
+                    "name": f"{chain} chain default policy: {policy}",
+                    "direction": {"INPUT": "in", "OUTPUT": "out"}.get(chain),
+                    "protocol": "all",
+                    "port": None,
+                    "service": "ALL",
+                    "action": policy.lower(),
+                })
             continue
         parts = line.split()
         if len(parts) < 2 or parts[0] not in ("DROP", "REJECT"):
@@ -1206,8 +1324,11 @@ def _firewall_linux_iptables(errors):
         target, raw_proto = parts[0], parts[1]
         proto = _IPTABLES_PROTO_NUMBERS.get(raw_proto, raw_proto)
         is_icmp = proto in ("icmp", "icmpv6")
+        is_blanket = proto == "all"
         port, service = (None, None)
-        if proto in ("tcp", "udp"):
+        if is_blanket:
+            service = "ALL"
+        elif proto in ("tcp", "udp"):
             port_m = re.search(r"dpt:(\d+)", line)
             if port_m:
                 candidate = int(port_m.group(1))
@@ -1233,6 +1354,15 @@ def _firewall_linux_nft(errors):
     drop/reject lines that also mention ICMP or a _CONNECTIVITY_PORTS
     match, same "good enough, report clearly when it isn't" approach as
     the rest of this file's OS-tool parsing.
+
+    Also recognizes two blanket-block shapes as service "ALL": a chain's
+    own `policy drop;`/`policy reject;` line (nft's default-policy
+    syntax), and a drop/reject statement that names neither a port nor
+    ICMP at all -- most likely an unrestricted rule. This is a looser
+    heuristic than the other nft matches, flagged as such: nft can drop
+    a single non-tcp/udp/icmp protocol this same way, which would look
+    identical here. Kept anyway because missing an actual blanket rule
+    is worse than an occasional over-broad flag on this fallback path.
     """
     try:
         result = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True, timeout=10)
@@ -1252,22 +1382,35 @@ def _firewall_linux_nft(errors):
     suspects = []
     for line in result.stdout.splitlines():
         stripped = line.strip()
+
+        policy_m = re.match(r"^policy\s+(drop|reject)\s*;?", stripped, re.IGNORECASE)
+        if policy_m:
+            suspects.append({
+                "name": stripped, "direction": None, "protocol": "all",
+                "port": None, "service": "ALL", "action": policy_m.group(1).lower(),
+            })
+            continue
+
         if not re.search(r"\b(drop|reject)\b", stripped, re.IGNORECASE):
             continue
         is_icmp = re.search(r"\bicmpx?(v6)?\b", stripped, re.IGNORECASE) is not None
-        proto = "udp" if "udp" in stripped.lower() else "tcp" if "tcp" in stripped.lower() else "unknown"
+        proto = "udp" if "udp" in stripped.lower() else "tcp" if "tcp" in stripped.lower() else None
         port, service = (None, None)
-        port_m = re.search(r"dport\s+(\d+)", stripped)
-        if port_m and proto in ("tcp", "udp"):
-            candidate = int(port_m.group(1))
-            entry = _CONNECTIVITY_PORTS.get(candidate)
-            if entry and proto in entry[1]:
-                port, service = candidate, entry[0]
+        if proto:
+            port_m = re.search(r"dport\s+(\d+)", stripped)
+            if port_m:
+                candidate = int(port_m.group(1))
+                entry = _CONNECTIVITY_PORTS.get(candidate)
+                if entry and proto in entry[1]:
+                    port, service = candidate, entry[0]
+        is_blanket = not is_icmp and not service and proto is None
+        if is_blanket:
+            service = "ALL"
         if service or is_icmp:
             suspects.append({
                 "name": stripped,
                 "direction": None,
-                "protocol": "icmp" if is_icmp else proto,
+                "protocol": "icmp" if is_icmp else (proto or "all"),
                 "port": port,
                 "service": "ICMP" if is_icmp else service,
                 "action": "drop" if re.search(r"\bdrop\b", stripped, re.IGNORECASE) else "reject",
@@ -1276,9 +1419,16 @@ def _firewall_linux_nft(errors):
 
 
 def _firewall_macos(errors):
-    """Parses `pfctl -sr` for block rules matching a port in
-    _CONNECTIVITY_PORTS, or ICMP. Needs root -- pfctl's own error message
-    says so plainly, so that's passed through rather than guessed at."""
+    """
+    Parses `pfctl -sr` for block rules matching a port in
+    _CONNECTIVITY_PORTS, ICMP, or a blanket rule -- a `block` line naming
+    neither `udp` nor `tcp`. That's correct pf semantics, not a guess:
+    pf rules apply to all protocols by default when `proto` is omitted,
+    so the absence of either keyword genuinely means "blocks everything,"
+    same reasoning as iptables' protocol "all" rows. Needs root -- pfctl's
+    own error message says so plainly, so that's passed through rather
+    than guessed at.
+    """
     try:
         result = subprocess.run(["pfctl", "-sr"], capture_output=True, text=True, timeout=10)
     except FileNotFoundError:
@@ -1303,18 +1453,22 @@ def _firewall_macos(errors):
         is_icmp = "icmp" in lower
         proto = "udp" if "udp" in lower else "tcp" if "tcp" in lower else None
         port, service = (None, None)
-        port_m = re.search(r"port\s*=?\s*(\d+)", lower)
-        if port_m and proto:
-            candidate = int(port_m.group(1))
-            entry = _CONNECTIVITY_PORTS.get(candidate)
-            if entry and proto in entry[1]:
-                port, service = candidate, entry[0]
+        if proto:
+            port_m = re.search(r"port\s*=?\s*(\d+)", lower)
+            if port_m:
+                candidate = int(port_m.group(1))
+                entry = _CONNECTIVITY_PORTS.get(candidate)
+                if entry and proto in entry[1]:
+                    port, service = candidate, entry[0]
+        is_blanket = not is_icmp and not service and proto is None
+        if is_blanket:
+            service = "ALL"
         if service or is_icmp:
             direction = "in" if re.search(r"\bin\b", lower) else "out" if re.search(r"\bout\b", lower) else None
             suspects.append({
                 "name": stripped,
                 "direction": direction,
-                "protocol": "icmp" if is_icmp else proto,
+                "protocol": "icmp" if is_icmp else (proto or "all"),
                 "port": port,
                 "service": "ICMP" if is_icmp else service,
                 "action": "block",
@@ -1325,17 +1479,24 @@ def _firewall_macos(errors):
 def check_firewall_rules():
     """
     Reads the actual local firewall ruleset for any rule that blocks one
-    of _CONNECTIVITY_PORTS (DNS, HTTP, HTTPS, DHCP) or ICMP specifically.
-    Pure data gathering, same as every other function in this file --
-    this reports what rules exist, it doesn't decide whether one of them
-    explains a connectivity problem. A2's check_firewall_blocking() is
-    what correlates a matching rule against an actual failure and calls
-    it a likely cause.
+    of _CONNECTIVITY_PORTS (DNS, HTTP, HTTPS, DHCP), ICMP, or blocks
+    everything (service "ALL" -- see _firewall_windows()/
+    _firewall_linux_iptables()/etc. for what that covers per platform,
+    including Windows' profile-level default outbound policy, which is
+    a separate check since it isn't a rule at all). Pure data gathering,
+    same as every other function in this file -- this reports what
+    rules exist, it doesn't decide whether one of them explains a
+    connectivity problem. A2's check_firewall_blocking() is what
+    correlates a matching rule against an actual failure and calls it a
+    likely cause.
 
     Only returns that small, curated subset of rules, not a full ruleset
     dump -- nothing downstream needs the rest, and a wider net would mean
     flagging a customer's legitimate custom rule as if it were the cause
-    of a problem it has nothing to do with.
+    of a problem it has nothing to do with. "ALL" is the one deliberate
+    exception to "curated by specific service" -- a blanket rule isn't
+    a legitimate custom rule for something unrelated, it's evidence
+    against every connectivity symptom at once.
 
     Known limitation: reading the full ruleset needs root on Linux
     (iptables/nft) and macOS (pfctl). Without it, the errors list
@@ -1351,6 +1512,13 @@ def check_firewall_rules():
     try:
         if SYSTEM == "Windows":
             suspects = _firewall_windows(errors)
+            outbound_blocked = _windows_firewall_profile_policy(errors)
+            if outbound_blocked:
+                suspects.append({
+                    "name": "Windows Firewall profile default (Outbound connections: Block)",
+                    "direction": "out", "protocol": "all", "port": None,
+                    "service": "ALL", "action": "block",
+                })
         elif SYSTEM == "Linux":
             result = _firewall_linux_iptables(errors)
             if result is None:
@@ -2206,7 +2374,10 @@ def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False, skip_u
             print(f"  ! {err}")
         if firewall_rules:
             for r in firewall_rules:
-                print(f"  ! {r['name']} blocks {r['service']}" + (f" (port {r['port']})" if r["port"] else ""))
+                if r["service"] == "ALL":
+                    print(f"  ! {r['name']} blocks ALL outbound traffic")
+                else:
+                    print(f"  ! {r['name']} blocks {r['service']}" + (f" (port {r['port']})" if r["port"] else ""))
         elif not firewall_errors:
             print("  No rules blocking DNS/HTTP/HTTPS/DHCP/ICMP found.")
 

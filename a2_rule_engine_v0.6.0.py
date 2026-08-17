@@ -3,8 +3,22 @@
 a2_rule_engine.py -- Module A2 (Rule Engine) of the offline network
 diagnostic app.
 
-VERSION: 0.5.0
+VERSION: 0.6.0
 CHANGELOG:
+  0.6.0 - A1 v0.12.0 added a new "ALL" service to check_firewall_rules()
+          for a rule that blocks everything (no protocol/port
+          restriction, a chain/profile default-deny, or on Windows a
+          rule with Protocol=Any/RemotePort=Any -- Ammar's specific
+          example). check_firewall_blocking() gets a matching branch:
+          fires if *any* of the four existing broken conditions is
+          true, not just its one specific symptom like the other
+          services -- a blanket rule is consistent with all of them at
+          once, so it shouldn't need to match one narrowly. Whichever
+          symptom is actually present is what the finding names.
+          Tested against a real bare `-j DROP` rule and a real chain
+          default policy of DROP in this sandbox (both now produce a
+          critical finding); confirmed the five prior per-service
+          detections are unaffected.
   0.5.0 - A1 v0.11.0 widened check_firewall_rules() from DNS/ICMP-only to
           a small named set of connectivity-relevant ports (DNS, HTTP,
           HTTPS, DHCP client/server). check_firewall_blocking() rewritten
@@ -133,8 +147,8 @@ CHANGELOG:
 Standard-library only. No pip installs, same reason as A1 -- see CLAUDE.md.
 
 Run it against a saved scan:
-    python3 network_discovery_v0.11.0.py --json scan.json
-    python3 a2_rule_engine_v0.5.0.py --input scan.json
+    python3 network_discovery_v0.12.0.py --json scan.json
+    python3 a2_rule_engine_v0.6.0.py --input scan.json
 
 Note: this has to be a two-step, file-based handoff, not a direct pipe.
 A1's `--json` with no path still prints its normal plain-language output
@@ -143,7 +157,7 @@ A2 hands it a mix of prose and JSON, not valid JSON on its own. Always
 give A1 a real path (`--json scan.json`) when the output is meant for A2.
 
 Dump findings as JSON instead of/alongside the plain-language printout:
-    python3 a2_rule_engine_v0.5.0.py --input scan.json --json findings.json
+    python3 a2_rule_engine_v0.6.0.py --input scan.json --json findings.json
 """
 
 import argparse
@@ -517,6 +531,13 @@ def check_firewall_blocking(data):
         anywhere, so there's no symptom to attach this to yet -- a known
         gap, not a bug. A1 still gathers it in case a future check needs
         it.
+      - ALL blocked   -> fires if *any* of the four conditions above is
+        true, not just one. A blanket rule (no protocol/port
+        restriction, or a chain/profile default-deny) isn't evidence
+        for one specific service -- it's consistent with every symptom
+        at once, so it shouldn't need to match a specific one to be
+        worth surfacing. Whichever symptom is actually present is what
+        the summary names.
 
     One finding per matching rule; severity matches whatever it's
     explaining rather than a scale of its own.
@@ -553,15 +574,28 @@ def check_firewall_blocking(data):
             if not gateway_missing:
                 continue
             severity, context = SEV_CRITICAL, "no gateway/router could be found"
+        elif service == "ALL":
+            if gateway_missing:
+                context = "no gateway/router could be found"
+            elif internet_broken:
+                context = "the internet is unreachable"
+            elif gateway_unreachable:
+                context = "the router isn't responding to pings"
+            elif dns_broken:
+                context = "DNS isn't resolving"
+            else:
+                continue
+            severity = SEV_CRITICAL
         else:
             # HTTP and anything else A1 gathers but has no correlated
             # symptom for yet -- not flagged, to avoid false attribution.
             continue
 
+        summary_service = "all outbound traffic" if service == "ALL" else service
         findings.append(make_finding(
             rule_id="firewall_blocking_connectivity", category="security", severity=severity,
             target=rule.get("name", "firewall rule"),
-            summary=(f"A local firewall rule ({rule.get('name', 'unnamed')}) blocks {service} "
+            summary=(f"A local firewall rule ({rule.get('name', 'unnamed')}) blocks {summary_service} "
                      f"-- likely why {context}."),
             detail=str(rule), fix_classification=FIX_GUIDED,
             evidence={"firewall_rule": rule, "internet": internet, "dns_resolution": dns_res,

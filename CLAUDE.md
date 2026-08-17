@@ -237,16 +237,33 @@ a non-technical install target later). Current version does:
   maps back to names instead of silently missing the rule. Re-verified
   after the port-set widening (rules for udp/53, tcp/80, tcp/443,
   udp/67, and icmp all correctly caught; an unrelated tcp/8080 rule
-  still correctly ignored). Windows/macOS parsing is **not yet verified
-  on real hardware**. Skippable with `--no-firewall`
+  still correctly ignored). **v0.12.0** added a sixth category, "ALL"
+  (blocks everything): a rule with no protocol/port restriction, a
+  chain/table default-deny policy (`Chain OUTPUT (policy DROP)` on
+  Linux — a genuinely different mechanism from an individual rule,
+  previously invisible for a second reason: the chain-header parser
+  only ever captured the chain name, never the policy verdict next to
+  it), or on Windows a rule with `Protocol=Any`/`RemotePort=Any`
+  (Ammar's specific example) plus a new check of the Windows Firewall
+  profile's own default outbound action, which is a policy setting, not
+  a rule, so no amount of per-rule parsing could ever have caught it.
+  "ALL" is the one deliberate exception to "curated by specific
+  service" — a blanket block isn't a legitimate unrelated custom rule,
+  it's evidence against every connectivity symptom at once. Verified
+  against a real bare `-j DROP` rule and a real chain default policy of
+  DROP in this sandbox; also caught a second real parsing gap along the
+  way — this container's iptables printed protocol `0` (not the
+  expected string `all`) for an unrestricted rule, now mapped
+  alongside the earlier 17/1 → udp/icmp fix. Windows/macOS parsing is
+  **not yet verified on real hardware**. Skippable with `--no-firewall`
 - JSON export (`--json`) in the shape that will eventually be handed to A6
   directly instead of a file
 - `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` /
   `--no-firewall` flags to skip slower or internet/LAN-broadcast-touching
   steps
 
-**A2 (Rule Engine) is started (v0.5.0).** Standard-library-only Python,
-in its own file (`a2_rule_engine_v0.5.0.py`), deliberately never importing
+**A2 (Rule Engine) is started (v0.6.0).** Standard-library-only Python,
+in its own file (`a2_rule_engine_v0.6.0.py`), deliberately never importing
 A1's file directly -- it reads the same dict A1's `--json` export produces
 (file-based handoff: A1 writes `--json scan.json`, A2 reads `--input
 scan.json`), so A1 can keep bumping its own version/filename with zero
@@ -351,10 +368,23 @@ changes needed in A2. Current version does:
   both matching and deliberately-mismatched connectivity contexts (e.g.
   an ICMP-blocking rule present while the gateway is actually fine --
   confirmed no finding).
+- **New branch (v0.6.0): a firewall rule that blocks everything.** A1
+  v0.12.0 added an "ALL" service to `check_firewall_rules()` for a rule
+  with no protocol/port restriction, a chain/profile default-deny, or
+  (Ammar's specific example) a Windows rule with
+  `Protocol=Any`/`RemotePort=Any` -- see A1's entry above.
+  `check_firewall_blocking()` fires this branch against *any* of the
+  four existing broken conditions, not just one specific symptom like
+  the other services, since a blanket block is consistent with all of
+  them at once rather than pointing at one narrowly; whichever symptom
+  is actually present is what the finding names. Tested against a real
+  bare `-j DROP` rule and a real chain default policy of DROP in this
+  sandbox (both produce a critical finding); confirmed the five
+  per-service detections from v0.5.0 are unaffected.
 - Tested end-to-end against this file's own A1 output, synthetic data
   covering every rule, and Ammar's first real hardware scan (which is what
   surfaced the v0.2.0 fix) -- next up: run the current version against
-  real hardware again to confirm the v0.2.0 through v0.5.0 changes, then
+  real hardware again to confirm the v0.2.0 through v0.6.0 changes, then
   expand the rule set further
 
 **Note: the A1-to-A2 JSON file handoff is temporary, not the final
