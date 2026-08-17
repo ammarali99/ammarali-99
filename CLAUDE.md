@@ -214,13 +214,32 @@ a non-technical install target later). Current version does:
   back as exactly 2^32-1 (an overflowed/wrapped 32-bit counter, or a
   "not really supported" sentinel). All three are now flagged in plain
   language instead of printed as if they were real data
+- Local firewall rule scan (`check_firewall_rules()`) — reads the actual
+  firewall ruleset (`netsh advfirewall` on Windows, `iptables`/`nft` on
+  Linux, `pfctl` on macOS) for any rule that blocks DNS (port 53) or ICMP
+  specifically. Pure data gathering, no verdict attached — A2's
+  `check_firewall_blocking()` is what decides a matching rule actually
+  explains a connectivity failure (see A2's current-state entry below;
+  this is the same A1-gathers/A2-decides split as everything else in the
+  architecture). Only returns the small subset of rules that block
+  DNS/ICMP, not a full ruleset dump. **Known limitation:** reading the
+  full ruleset needs root on Linux/macOS (Windows' `netsh advfirewall`
+  doesn't need elevation) — without it, the errors list says so instead
+  of silently reporting "no blocking rules found." Verified against a
+  real ruleset in this sandbox: caught a real parsing gap along the way
+  — `iptables -L -n` printed protocol *numbers* (17, 1) instead of names
+  (udp, icmp) here despite a populated `/etc/protocols`, which the
+  parser now maps back to names instead of silently missing the rule.
+  Windows/macOS parsing is **not yet verified on real hardware**.
+  Skippable with `--no-firewall`
 - JSON export (`--json`) in the shape that will eventually be handed to A6
   directly instead of a file
-- `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` flags to
-  skip slower or internet/LAN-broadcast-touching steps
+- `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` /
+  `--no-firewall` flags to skip slower or internet/LAN-broadcast-touching
+  steps
 
-**A2 (Rule Engine) is started (v0.3.0).** Standard-library-only Python,
-in its own file (`a2_rule_engine_v0.3.0.py`), deliberately never importing
+**A2 (Rule Engine) is started (v0.4.0).** Standard-library-only Python,
+in its own file (`a2_rule_engine_v0.4.0.py`), deliberately never importing
 A1's file directly -- it reads the same dict A1's `--json` export produces
 (file-based handoff: A1 writes `--json scan.json`, A2 reads `--input
 scan.json`), so A1 can keep bumping its own version/filename with zero
@@ -238,7 +257,7 @@ changes needed in A2. Current version does:
 - `evaluate()`: runs every registered rule against A1's discovery dict,
   wrapping each one individually so one rule raising an exception doesn't
   take down the rest (same defensive pattern as A1's own scan steps)
-- Rule set (11 rules): Wi-Fi radio off (hardware/software), adapter
+- Rule set (12 rules): Wi-Fi radio off (hardware/software), adapter
   disabled, adapter enabled-but-not-connected, no gateway found, gateway
   unreachable/high packet loss/high latency, internet unreachable (with a
   WAN-vs-LAN distinction based on whether the gateway itself is reachable),
@@ -246,7 +265,8 @@ changes needed in A2. Current version does:
   through from A1's `_upnp_sanity_notes()` rather than re-parsed here, to
   avoid a second, fragile copy of that detection logic), insecure Telnet
   port open, Wi-Fi channel congestion recommendation, DNS not configured,
-  DNS configured but not resolving (v0.3.0, see below)
+  DNS configured but not resolving (v0.3.0, see below), a local firewall
+  rule blocking DNS/ICMP (v0.4.0, see below)
 - CLI: prints findings sorted by severity with a summary count, `--json`
   export in the same shape A6 will eventually store directly
 - **Severity now scales with actual connectivity impact (v0.2.0), not just
@@ -283,11 +303,30 @@ changes needed in A2. Current version does:
   trigger condition (internet reachable, DNS specifically not) is already
   precise enough to always be worth surfacing, the same reasoning as
   `check_pool_usage()` and `check_dns_missing()`.
+- **New rule (v0.4.0): a local firewall rule blocking DNS or ICMP.** A1
+  v0.10.0 added `check_firewall_rules()` -- the actual local firewall
+  ruleset (`netsh advfirewall` / `iptables`+`nft` / `pfctl`), filtered
+  down to rules that block DNS (port 53) or ICMP. That's pure data
+  gathering with no verdict attached, same as everything else A1 does --
+  `check_firewall_blocking()` is what correlates a matching rule against
+  an actual DNS/internet failure (from the same discovery dict) and
+  produces a specific "this rule is likely why" finding, instead of
+  leaving the customer with just a bare "DNS isn't resolving." Severity
+  matches whatever it's explaining (critical if the internet itself is
+  unreachable, warning if only DNS is) rather than a new scale of its
+  own. This is the same A1-gathers/A2-decides split the architecture
+  table already draws for every module -- A1 has no opinion about
+  whether a rule matters, A2 does. Tested against a real iptables
+  ruleset in this sandbox (see A1's entry above for the real parsing
+  gap that testing caught) plus synthetic fixtures for all three
+  correlation cases (DNS-broken, internet-broken, rule-present-but-
+  nothing-actually-wrong -- confirmed the last one correctly produces no
+  finding).
 - Tested end-to-end against this file's own A1 output, synthetic data
   covering every rule, and Ammar's first real hardware scan (which is what
   surfaced the v0.2.0 fix) -- next up: run the current version against
-  real hardware again to confirm both the v0.2.0 and v0.3.0 changes, then
-  expand the rule set further
+  real hardware again to confirm the v0.2.0, v0.3.0, and v0.4.0 changes,
+  then expand the rule set further
 
 **Note: the A1-to-A2 JSON file handoff is temporary, not the final
 design.** A1 and A2 currently pass data through a JSON file

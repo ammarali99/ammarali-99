@@ -3,8 +3,25 @@
 a2_rule_engine.py -- Module A2 (Rule Engine) of the offline network
 diagnostic app.
 
-VERSION: 0.3.0
+VERSION: 0.4.0
 CHANGELOG:
+  0.4.0 - A1 v0.10.0 added check_firewall_rules() -- the actual local
+          firewall ruleset, filtered down to rules that block DNS (port
+          53) or ICMP. Added check_firewall_blocking(): correlates that
+          against the connectivity findings other rules already compute
+          (DNS not resolving, internet unreachable) and, when a matching
+          rule exists, produces a specific "this firewall rule is likely
+          why" finding instead of leaving the customer with just a bare
+          "DNS isn't resolving." This is exactly the A1-gathers/A2-
+          decides split CLAUDE.md already draws for every module: A1's
+          check_firewall_rules() reports facts with no verdict attached,
+          A2 is what turns "a matching rule exists" + "DNS is actually
+          broken" into an actual diagnosis. Severity matches whatever
+          it's explaining (critical if the internet itself is
+          unreachable, warning if only DNS is) rather than introducing a
+          third severity scale. One finding per matching rule, using the
+          rule's own name/description as the finding's target, so
+          finding_id stays stable and distinct per rule across scans.
   0.3.0 - A1 v0.9.0 added dns_resolution (servers_tested, any_working) --
           whether each configured DNS server actually resolves names, not
           just whether one is configured. Added check_dns_not_resolving():
@@ -89,8 +106,8 @@ CHANGELOG:
 Standard-library only. No pip installs, same reason as A1 -- see CLAUDE.md.
 
 Run it against a saved scan:
-    python3 network_discovery_v0.9.0.py --json scan.json
-    python3 a2_rule_engine_v0.3.0.py --input scan.json
+    python3 network_discovery_v0.10.0.py --json scan.json
+    python3 a2_rule_engine_v0.4.0.py --input scan.json
 
 Note: this has to be a two-step, file-based handoff, not a direct pipe.
 A1's `--json` with no path still prints its normal plain-language output
@@ -99,7 +116,7 @@ A2 hands it a mix of prose and JSON, not valid JSON on its own. Always
 give A1 a real path (`--json scan.json`) when the output is meant for A2.
 
 Dump findings as JSON instead of/alongside the plain-language printout:
-    python3 a2_rule_engine_v0.3.0.py --input scan.json --json findings.json
+    python3 a2_rule_engine_v0.4.0.py --input scan.json --json findings.json
 """
 
 import argparse
@@ -446,6 +463,56 @@ def check_dns_not_resolving(data):
     return []
 
 
+def check_firewall_blocking(data):
+    """
+    Correlates A1's firewall rule scan against the connectivity findings
+    other rules already compute: if DNS isn't resolving or the internet
+    is unreachable, AND a local firewall rule blocks DNS (port 53) or
+    ICMP specifically, that's a far more actionable diagnosis than a bare
+    "DNS isn't resolving" -- this is A2's job (decide from A1's
+    structured data), not A1's (which only reports what rules exist, no
+    verdict). One finding per matching rule.
+
+    Severity matches whichever problem it's explaining -- critical if
+    the internet itself is unreachable (same severity as
+    check_internet_reachability's own finding for that state), warning
+    if only DNS is broken (same as check_dns_not_resolving's) -- rather
+    than inventing a third severity scale for the same underlying issue.
+    """
+    suspects = data.get("firewall_rules") or []
+    if not suspects:
+        return []
+
+    internet = data.get("internet") or {}
+    dns_res = data.get("dns_resolution") or {}
+    dns_broken = internet.get("reachable") is True and dns_res.get("any_working") is False
+    internet_broken = internet.get("reachable") is False
+
+    if not (dns_broken or internet_broken):
+        return []
+
+    severity = SEV_CRITICAL if internet_broken else SEV_WARNING
+    context = "the internet is unreachable" if internet_broken else "DNS isn't resolving"
+
+    findings = []
+    for rule in suspects:
+        protocol = rule.get("protocol", "")
+        is_dns_rule = protocol in ("tcp", "udp") and rule.get("port") == 53
+        is_icmp_rule = protocol.startswith("icmp")
+        if not (is_dns_rule or is_icmp_rule):
+            continue
+        target_desc = "DNS (port 53)" if is_dns_rule else "ICMP"
+        findings.append(make_finding(
+            rule_id="firewall_blocking_dns_or_icmp", category="security", severity=severity,
+            target=rule.get("name", "firewall rule"),
+            summary=(f"A local firewall rule ({rule.get('name', 'unnamed')}) blocks {target_desc} "
+                     f"-- likely why {context}."),
+            detail=str(rule), fix_classification=FIX_GUIDED,
+            evidence={"firewall_rule": rule, "internet": internet, "dns_resolution": dns_res},
+        ))
+    return findings
+
+
 # Every rule the engine runs. Add new checks here.
 RULES = [
     check_wifi_radio_off,
@@ -459,6 +526,7 @@ RULES = [
     check_wifi_channel_recommendation,
     check_dns_missing,
     check_dns_not_resolving,
+    check_firewall_blocking,
 ]
 
 
