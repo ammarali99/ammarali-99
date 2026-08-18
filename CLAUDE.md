@@ -267,8 +267,8 @@ actually used — see below). Current version does:
   `--no-firewall` flags to skip slower or internet/LAN-broadcast-touching
   steps
 
-**A2 (Rule Engine) is started (v0.7.0).** Standard-library-only Python,
-in its own file (`a2_rule_engine_v0.7.0.py`), deliberately never importing
+**A2 (Rule Engine) is started (v0.7.1).** Standard-library-only Python,
+in its own file (`a2_rule_engine_v0.7.1.py`), deliberately never importing
 A1's file directly -- it reads the same dict A1's `--json` export produces
 (file-based handoff: A1 writes `--json scan.json`, A2 reads `--input
 scan.json`), so A1 can keep bumping its own version/filename with zero
@@ -471,12 +471,28 @@ that already depended on the JSON files broke. New:
   `cryptography` isn't available.
 - Verified end-to-end in this sandbox: `network_discovery_v0.13.0.py
   --cache` wrote a real scan into a fresh A6 database, then
-  `a2_rule_engine_v0.7.0.py --cache` (no `--input` given at all) picked
+  `a2_rule_engine_v0.7.1.py --cache` (no `--input` given at all) picked
   up that exact scan, evaluated it, and wrote the resulting finding back
   linked to the right scan id -- confirmed via A6's own `--list-scans`/
   `--list-findings`. Also re-confirmed `--json` still works unchanged on
   its own (regression check), and that the raw `.db` file still doesn't
   leak the scan's real IP in plaintext.
+- **Real bug, caught by Ammar on his first run (v0.7.1 fix):** running A2
+  with no `--input`, no `--cache`, and nothing piped in looked like a
+  dead, black `cmd` window -- no crash, no message. Cause: `_load_input()`
+  fell back to `sys.stdin.read()`, which blocks forever on a real
+  terminal with nothing piped in. Same silent-failure shape as A1's
+  Wi-Fi-scan and DNS-detection bugs, just wearing a hang's clothes
+  instead of an empty result. Fixed: `_load_input()` now checks
+  `sys.stdin.isatty()` and raises a clear `NoInputError` telling you what
+  to pass instead of blocking silently, when stdin is a live terminal and
+  neither `--input` nor `--cache` was given. Piped stdin (`cat scan.json |
+  a2 ...`) is unaffected. Verified with a real pty in this sandbox (a
+  plain subprocess pipe doesn't reproduce `isatty()==True` -- needed
+  `pty.spawn()` to actually simulate a bare interactive terminal):
+  confirmed the old code hung with zero output, confirmed this version
+  prints the message and exits immediately. Re-confirmed `--input`,
+  `--cache`, and piped stdin all still work unchanged.
 
 Everything else (A3, A4, A5, A7, the Credential Manager, AI1) is not
 started yet.
@@ -543,7 +559,7 @@ started yet.
 
 ## On the horizon
 
-- **Re-test A1 v0.13.0 / A2 v0.7.0 against Ammar's real hardware** — not
+- **Re-test A1 v0.13.0 / A2 v0.7.1 against Ammar's real hardware** — not
   yet done since the v0.2.0–v0.6.0 rule/severity changes landed, and now
   also covers the new `--cache` wiring (A1 writing a real scan into A6,
   A2 reading it back out and writing findings to A6) on a real machine,

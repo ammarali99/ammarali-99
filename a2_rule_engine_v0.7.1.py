@@ -3,8 +3,39 @@
 a2_rule_engine.py -- Module A2 (Rule Engine) of the offline network
 diagnostic app.
 
-VERSION: 0.7.0
+VERSION: 0.7.1
 CHANGELOG:
+  0.7.1 - Fixed a real bug Ammar hit testing v0.13.0/v0.7.0's new --cache
+          wiring: running A2 with no --input, no --cache, and nothing
+          piped into it looked like a dead, black cmd window -- no
+          crash, no message, just silence. The cause: `_load_input()`
+          falls back to `sys.stdin.read()` when --input isn't given,
+          and on a real interactive terminal with nothing piped in,
+          that call blocks forever waiting for input that's never
+          coming (Ctrl+Z/Ctrl+D on Windows/Unix). That's not a hang
+          bug so much as a silent-failure bug wearing a hang's
+          clothes -- the exact shape of bug this codebase has fixed
+          everywhere else (A1's Wi-Fi scan in v0.2.0, DNS/interface
+          detection in v0.4.0): something goes wrong with zero
+          indication anything is happening at all.
+
+          `_load_input()` now checks `sys.stdin.isatty()` before
+          reading: if stdin is a live terminal (not a pipe or
+          redirect) and neither --input nor --cache was given, it
+          raises a new NoInputError with a plain-language message
+          telling you what to pass instead of blocking silently.
+          Piping a real scan into stdin (`cat scan.json | a2 ...`) is
+          unaffected -- isatty() is false in that case, so the normal
+          read still happens.
+
+          Verified in this sandbox with a real pty (a plain subprocess
+          pipe doesn't reproduce isatty()==True, needed pty.spawn() to
+          actually simulate an interactive terminal with nothing
+          piped in): confirmed the old behavior hung with zero output,
+          confirmed this version prints the message and exits
+          immediately instead. Re-confirmed --input, --cache, and
+          piped stdin (cat scan.json | ...) all still work unchanged.
+
   0.7.0 - Wires A2 into A6 (Encrypted Local Cache) directly -- the other
           half of the "small plumbing change" CLAUDE.md flagged once A6
           existed (A1 v0.13.0 got its half first). New `--cache` flag:
@@ -173,8 +204,8 @@ CHANGELOG:
 Standard-library only. No pip installs, same reason as A1 -- see CLAUDE.md.
 
 Run it against a saved scan:
-    python3 network_discovery_v0.12.0.py --json scan.json
-    python3 a2_rule_engine_v0.6.0.py --input scan.json
+    python3 network_discovery_v0.13.0.py --json scan.json
+    python3 a2_rule_engine_v0.7.1.py --input scan.json
 
 Note: this has to be a two-step, file-based handoff, not a direct pipe.
 A1's `--json` with no path still prints its normal plain-language output
@@ -183,10 +214,11 @@ A2 hands it a mix of prose and JSON, not valid JSON on its own. Always
 give A1 a real path (`--json scan.json`) when the output is meant for A2.
 
 Dump findings as JSON instead of/alongside the plain-language printout:
-    python3 a2_rule_engine_v0.7.0.py --input scan.json --json findings.json
+    python3 a2_rule_engine_v0.7.1.py --input scan.json --json findings.json
 
 Or skip the JSON file entirely and read/write straight through A6:
-    python3 a2_rule_engine_v0.7.0.py --cache
+    python3 network_discovery_v0.13.0.py --cache
+    python3 a2_rule_engine_v0.7.1.py --cache
 """
 
 import argparse
@@ -701,8 +733,21 @@ def evaluate(data):
     return findings, errors
 
 
+class NoInputError(Exception):
+    """Raised when neither --input, --cache, nor piped stdin was given."""
+
+
 def _load_input(path):
     if path in (None, "-"):
+        if path is None and sys.stdin.isatty():
+            # Reading stdin here would just block forever with zero output on
+            # screen -- indistinguishable from a hang/black screen to anyone
+            # running this without piping something in. Report it instead.
+            raise NoInputError(
+                "No --input file given, --cache not used, and nothing is piped in. "
+                "Run with --input scan.json, --cache (to read from A6 instead), or "
+                "pipe a scan's JSON into stdin."
+            )
         raw = sys.stdin.read()
     else:
         with open(path) as f:
@@ -789,6 +834,9 @@ def main():
     else:
         try:
             data = _load_input(args.input)
+        except NoInputError as e:
+            print(f"{e}", file=sys.stderr)
+            return 1
         except FileNotFoundError:
             print(f"Input file not found: {args.input}", file=sys.stderr)
             return 1
