@@ -3,8 +3,34 @@
 a2_rule_engine.py -- Module A2 (Rule Engine) of the offline network
 diagnostic app.
 
-VERSION: 0.6.0
+VERSION: 0.7.0
 CHANGELOG:
+  0.7.0 - Wires A2 into A6 (Encrypted Local Cache) directly -- the other
+          half of the "small plumbing change" CLAUDE.md flagged once A6
+          existed (A1 v0.13.0 got its half first). New `--cache` flag:
+          instead of `--input scan.json`, reads the most recent scan
+          straight out of A6 (or a specific one via `--cache-scan-id`),
+          runs the same `evaluate()` unchanged, and writes findings back
+          into A6 via `write_findings()` linked to that scan's id,
+          instead of only a JSON file. `--input`/`--json` still work
+          exactly as before and are unaffected when `--cache` isn't
+          passed -- this is additive, not a replacement.
+
+          Same dynamic-import trick A1 v0.13.0 uses for the same reason:
+          `_import_a6()` globs for `a6_encrypted_cache_v*.py` next to
+          this file rather than hardcoding a version, so A6 can keep
+          bumping its own filename with zero changes needed here --
+          matching the existing reasoning A2 already applies to *not*
+          importing A1 directly. `cryptography` (A6's dependency) is
+          only imported lazily inside `_import_a6()`, only when
+          `--cache` is used, so A2 itself stays standard-library-only
+          otherwise.
+
+          Verified: ran A1 v0.13.0 --cache against this sandbox's
+          network, then A2 --cache with no --input at all, confirmed it
+          picked up that exact scan from A6, evaluated it, and wrote the
+          resulting finding back into A6 linked to the right scan id.
+
   0.6.0 - A1 v0.12.0 added a new "ALL" service to check_firewall_rules()
           for a rule that blocks everything (no protocol/port
           restriction, a chain/profile default-deny, or on Windows a
@@ -157,14 +183,47 @@ A2 hands it a mix of prose and JSON, not valid JSON on its own. Always
 give A1 a real path (`--json scan.json`) when the output is meant for A2.
 
 Dump findings as JSON instead of/alongside the plain-language printout:
-    python3 a2_rule_engine_v0.6.0.py --input scan.json --json findings.json
+    python3 a2_rule_engine_v0.7.0.py --input scan.json --json findings.json
+
+Or skip the JSON file entirely and read/write straight through A6:
+    python3 a2_rule_engine_v0.7.0.py --cache
 """
 
 import argparse
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime, timezone
+
+
+def _import_a6():
+    """
+    Dynamically loads whichever a6_encrypted_cache_v*.py sits next to this
+    file, picking the highest (major, minor, patch) version present --
+    same reasoning A2 already uses to avoid hardcoding A1's version: A6
+    can keep bumping its own filename with zero changes needed here.
+    Returns None if no A6 file is found (--cache then reports that
+    clearly instead of crashing).
+    """
+    import glob
+    import importlib.util
+    import re as _re
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = glob.glob(os.path.join(here, "a6_encrypted_cache_v*.py"))
+    if not candidates:
+        return None
+
+    def _version_key(path):
+        m = _re.search(r"_v(\d+)\.(\d+)\.(\d+)\.py$", path)
+        return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+    path = max(candidates, key=_version_key)
+    spec = importlib.util.spec_from_file_location("a6_encrypted_cache", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 # Fix classifications a finding can carry. A3 (Fix Engine, not built yet)
 # will act on these later; A2's job is only to decide the classification,
@@ -675,23 +734,79 @@ def main():
         description="Offline rule engine (Module A2) -- reads A1's discovery JSON and flags known issues"
     )
     parser.add_argument("--input", default=None,
-                         help="Path to A1's --json output. Omit to read from stdin.")
+                         help="Path to A1's --json output. Omit to read from stdin. Ignored if --cache is given.")
     parser.add_argument("--json", nargs="?", const="-", default=None,
                          help="Export findings as JSON. Give a path to write to a file, "
                               "or omit the path to print JSON to stdout.")
+    parser.add_argument("--cache", action="store_true",
+                         help="Read the scan straight from A6 (Encrypted Local Cache) instead of --input, and "
+                              "write findings back into A6 linked to that scan. Needs a6_encrypted_cache_v*.py "
+                              "next to this file and the 'cryptography' package.")
+    parser.add_argument("--cache-db", default=None,
+                         help="A6 database path (default: A6's own default, network_cache.db)")
+    parser.add_argument("--cache-key", default=None,
+                         help="A6 key file path (default: A6's own default, network_cache.key)")
+    parser.add_argument("--cache-scan-id", type=int, default=None,
+                         help="With --cache, evaluate this specific A6 scan id instead of the most recent one")
     args = parser.parse_args()
 
-    try:
-        data = _load_input(args.input)
-    except FileNotFoundError:
-        print(f"Input file not found: {args.input}", file=sys.stderr)
-        return 1
-    except json.JSONDecodeError as e:
-        print(f"Input was not valid JSON: {e}", file=sys.stderr)
-        return 1
+    cache = None
+    scan_id = None
+    if args.cache:
+        a6 = _import_a6()
+        if a6 is None:
+            print("--cache: no a6_encrypted_cache_v*.py found next to this file -- nothing to read.",
+                  file=sys.stderr)
+            return 1
+        try:
+            kwargs = {}
+            if args.cache_db:
+                kwargs["db_path"] = args.cache_db
+            if args.cache_key:
+                kwargs["key_path"] = args.cache_key
+            cache = a6.A6Cache(**kwargs)
+        except ImportError as e:
+            print(f"--cache: {e}", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"--cache: could not open A6: {e}", file=sys.stderr)
+            return 1
+
+        # A6 v0.1.0 has no get-scan-by-id lookup, only get_scans(limit=N) sorted
+        # newest-first -- fine for a local single-user cache, flagged as a known
+        # gap to revisit if scan volume ever makes this worth adding to A6 itself.
+        scans = cache.get_scans(limit=10_000 if args.cache_scan_id is not None else 1)
+        if args.cache_scan_id is not None:
+            scans = [s for s in scans if s["id"] == args.cache_scan_id]
+        if not scans:
+            what = f"scan id {args.cache_scan_id}" if args.cache_scan_id is not None else "any scans"
+            print(f"--cache: A6 has no {what} -- run A1 with --cache first.", file=sys.stderr)
+            cache.close()
+            return 1
+        scan = scans[0]
+        scan_id = scan["id"]
+        data = scan["discovery"]
+    else:
+        try:
+            data = _load_input(args.input)
+        except FileNotFoundError:
+            print(f"Input file not found: {args.input}", file=sys.stderr)
+            return 1
+        except json.JSONDecodeError as e:
+            print(f"Input was not valid JSON: {e}", file=sys.stderr)
+            return 1
 
     findings, errors = evaluate(data)
     _print_findings(findings, errors)
+
+    if cache is not None:
+        try:
+            n = cache.write_findings(findings, scan_id=scan_id)
+            print(f"\nCached {n} finding(s) into A6, linked to scan id {scan_id}")
+        except Exception as e:
+            print(f"\n! --cache: failed to write findings back to A6: {e}", file=sys.stderr)
+        finally:
+            cache.close()
 
     if args.json:
         payload = json.dumps({"findings": findings, "errors": errors}, indent=2)

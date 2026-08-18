@@ -111,7 +111,9 @@ ever sees what A7 chooses to push, on its own schedule.
 
 **A1 (Discovery module) is built and being iterated on.** Standard-library-
 only Python (no pip installs — deliberate, keeps setup friction at zero for
-a non-technical install target later). Current version does:
+a non-technical install target later; the one opt-in exception is `--cache`,
+which lazily needs A6's `cryptography` dependency only when that flag is
+actually used — see below). Current version does:
 
 - Local IP/subnet detection, default gateway detection
 - Threaded ping sweep + ARP table cross-reference (catches devices with
@@ -256,14 +258,17 @@ a non-technical install target later). Current version does:
   expected string `all`) for an unrestricted rule, now mapped
   alongside the earlier 17/1 → udp/icmp fix. Windows/macOS parsing is
   **not yet verified on real hardware**. Skippable with `--no-firewall`
-- JSON export (`--json`) in the shape that will eventually be handed to A6
-  directly instead of a file
+- JSON export (`--json`), still fully supported
+- `--cache` (v0.13.0) writes the scan straight into A6 via `write_scan()`,
+  alongside or instead of `--json`. Dynamically loads whichever
+  `a6_encrypted_cache_v*.py` is present rather than hardcoding a version
+  (`--cache-db` / `--cache-key` to override A6's default paths)
 - `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` /
   `--no-firewall` flags to skip slower or internet/LAN-broadcast-touching
   steps
 
-**A2 (Rule Engine) is started (v0.6.0).** Standard-library-only Python,
-in its own file (`a2_rule_engine_v0.6.0.py`), deliberately never importing
+**A2 (Rule Engine) is started (v0.7.0).** Standard-library-only Python,
+in its own file (`a2_rule_engine_v0.7.0.py`), deliberately never importing
 A1's file directly -- it reads the same dict A1's `--json` export produces
 (file-based handoff: A1 writes `--json scan.json`, A2 reads `--input
 scan.json`), so A1 can keep bumping its own version/filename with zero
@@ -293,6 +298,10 @@ changes needed in A2. Current version does:
   rule blocking DNS/ICMP (v0.4.0, see below)
 - CLI: prints findings sorted by severity with a summary count, `--json`
   export in the same shape A6 will eventually store directly
+- `--cache` (v0.7.0): skips `--input` entirely, reads the most recent scan
+  straight out of A6 (or a specific one via `--cache-scan-id`), evaluates
+  it unchanged, and writes findings back into A6 via `write_findings()`.
+  Same dynamic `_import_a6()` loader A1 v0.13.0 uses, for the same reason
 - **Severity now scales with actual connectivity impact (v0.2.0), not just
   raw component state.** Ammar's first real-hardware test (Wi-Fi switched
   off in software, but Ethernet was providing a working internet
@@ -438,13 +447,36 @@ A5 exist to write them. Current version does:
   bytes) so this module's own correctness doesn't depend on having A1/A2
   output on hand.
 
-**The A1-to-A2 JSON file handoff (`--json scan.json` / `--input
-scan.json`) is still in place** -- A6 existing doesn't change A1/A2 yet.
-Next step: wire A1's and A2's own CLIs to write through A6 directly
-(`json.dump()` -> `a6.write_scan()`/`a6.write_findings()`), which
-CLAUDE.md's earlier note already called a small plumbing change, not a
-rewrite -- A2's Finding schema was already designed to match A6's row
-shape.
+**A1 and A2 are now wired directly into A6 (v0.13.0 / v0.7.0).** The old
+JSON file handoff (`--json scan.json` / `--input scan.json`) still works
+exactly as before -- this was additive, not a replacement, so nothing
+that already depended on the JSON files broke. New:
+
+- A1's `--cache` flag writes the scan straight into A6 via
+  `write_scan()`, right alongside (or instead of) `--json`.
+- A2's `--cache` flag skips `--input` entirely: it reads the most recent
+  scan straight out of A6 (or a specific one via `--cache-scan-id`),
+  runs the exact same `evaluate()` unchanged, and writes findings back
+  into A6 via `write_findings()`, linked to that scan's id.
+- Neither file hardcodes A6's version number in an import statement --
+  same reasoning A2 already used to avoid hardcoding A1's: a
+  `_import_a6()` helper (identical in both files) globs for
+  `a6_encrypted_cache_v*.py` next to itself and loads whichever one has
+  the highest version, so A6 can keep bumping its own filename with zero
+  changes needed in A1 or A2.
+- `cryptography` (A6's dependency) is only ever imported lazily, inside
+  `_import_a6()`, and only when `--cache` is actually passed -- A1 and
+  A2 both stay standard-library-only otherwise, and a scan/evaluation
+  still completes normally (with a clear stderr message) if A6 or
+  `cryptography` isn't available.
+- Verified end-to-end in this sandbox: `network_discovery_v0.13.0.py
+  --cache` wrote a real scan into a fresh A6 database, then
+  `a2_rule_engine_v0.7.0.py --cache` (no `--input` given at all) picked
+  up that exact scan, evaluated it, and wrote the resulting finding back
+  linked to the right scan id -- confirmed via A6's own `--list-scans`/
+  `--list-findings`. Also re-confirmed `--json` still works unchanged on
+  its own (regression check), and that the raw `.db` file still doesn't
+  leak the scan's real IP in plaintext.
 
 Everything else (A3, A4, A5, A7, the Credential Manager, AI1) is not
 started yet.
@@ -511,13 +543,12 @@ started yet.
 
 ## On the horizon
 
-- **Re-test A1 v0.12.0 / A2 v0.6.0 against Ammar's real hardware** — not
-  yet done since the v0.2.0–v0.6.0 changes (severity scaling, DNS-not-
-  resolving, firewall correlation, the "ALL" blanket-block detection)
-  landed. Flagged as the next real-hardware checkpoint before either
-  module grows further.
-- Wire A1's and A2's own CLIs to write through A6 directly instead of the
-  JSON file handoff (small plumbing change, see A6's current-state entry)
+- **Re-test A1 v0.13.0 / A2 v0.7.0 against Ammar's real hardware** — not
+  yet done since the v0.2.0–v0.6.0 rule/severity changes landed, and now
+  also covers the new `--cache` wiring (A1 writing a real scan into A6,
+  A2 reading it back out and writing findings to A6) on a real machine,
+  not just this sandbox. Flagged as the next real-hardware checkpoint
+  before either module grows further.
 - Expand the MAC vendor OUI table (known gap, flagged above)
 - Add mDNS and SNMP to A1's discovery methods (currently ARP/ping/hostname/
   port-probe/Wi-Fi only)

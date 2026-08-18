@@ -3,8 +3,40 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.12.0
+VERSION: 0.13.0
 CHANGELOG:
+  0.13.0 - Wires A1 into A6 (Encrypted Local Cache) directly, the "small
+          plumbing change" CLAUDE.md flagged once A6 existed. New
+          `--cache` flag: after a scan, writes the discovery dict
+          straight into A6 via write_scan() instead of only a JSON
+          file. `--json` still works exactly as before and is
+          unaffected -- `--cache` is additive, not a replacement, so
+          existing scripts/workflows don't break.
+
+          A1 still doesn't hardcode an import of a specific A6 file
+          version, for the same reason it already avoids importing A2
+          directly (see A2's own changelog): a hardcoded
+          `import a6_encrypted_cache_v0_1_0` would break the moment A6
+          bumps its version and gets renamed, same fragility problem.
+          `_import_a6()` instead globs for `a6_encrypted_cache_v*.py`
+          next to this file and loads whichever one has the highest
+          (major, minor, patch) version number, so A6 can keep bumping
+          its own filename with zero changes needed here -- exactly the
+          same reasoning, just applied one hop further down the chain.
+
+          `cryptography` (A6's dependency) is only ever imported lazily,
+          inside `_import_a6()`, and only when `--cache` is actually
+          used -- A1 itself stays standard-library-only and runs fine
+          with zero pip installs if you never pass `--cache`. If A6
+          can't be found or `cryptography` isn't installed, `--cache`
+          reports the actual error and the scan still completes and
+          prints/exports normally -- caching is a secondary feature,
+          not something that should take down a scan.
+
+          Verified: ran with --cache against this sandbox's network,
+          confirmed a new row appeared in A6 with get_scans(), and that
+          --json export still worked unchanged in the same run.
+
   0.12.0 - check_firewall_rules() only ever recognized rules scoped to
           one of the five named ports -- a rule that blocks everything
           (no protocol/port restriction at all) matched none of those
@@ -282,6 +314,7 @@ with --no-firewall.
 import argparse
 import ipaddress
 import json
+import os
 import platform
 import random
 import re
@@ -295,6 +328,36 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
+
+
+def _import_a6():
+    """
+    Dynamically loads whichever a6_encrypted_cache_v*.py sits next to this
+    file, picking the highest (major, minor, patch) version present --
+    same reasoning A2 already uses to avoid hardcoding A1's version: A6
+    can keep bumping its own filename with zero changes needed here.
+    Returns None if no A6 file is found (--cache then reports that
+    clearly instead of crashing the scan).
+    """
+    import glob
+    import importlib.util
+    import re as _re
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = glob.glob(os.path.join(here, "a6_encrypted_cache_v*.py"))
+    if not candidates:
+        return None
+
+    def _version_key(path):
+        m = _re.search(r"_v(\d+)\.(\d+)\.(\d+)\.py$", path)
+        return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+    path = max(candidates, key=_version_key)
+    spec = importlib.util.spec_from_file_location("a6_encrypted_cache", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 # Ports we probe on every live host, and what finding an open one suggests
 # about the device's role. This is a coarse guess for A2 to refine later,
@@ -2438,6 +2501,13 @@ def main():
                          help="Skip the UPnP router query (still LAN-only, but a separate protocol/socket path)")
     parser.add_argument("--no-firewall", action="store_true",
                          help="Skip the local firewall rule scan (reading the full ruleset needs root on Linux/macOS)")
+    parser.add_argument("--cache", action="store_true",
+                         help="Also write this scan straight into A6 (Encrypted Local Cache) via write_scan(). "
+                              "Needs a6_encrypted_cache_v*.py next to this file and the 'cryptography' package.")
+    parser.add_argument("--cache-db", default=None,
+                         help="A6 database path (default: A6's own default, network_cache.db)")
+    parser.add_argument("--cache-key", default=None,
+                         help="A6 key file path (default: A6's own default, network_cache.key)")
     args = parser.parse_args()
 
     results = run_discovery(
@@ -2454,6 +2524,27 @@ def main():
             with open(args.json, "w") as f:
                 f.write(payload)
             print(f"\nWrote JSON results to {args.json}")
+
+    if args.cache:
+        a6 = _import_a6()
+        if a6 is None:
+            print("\n! --cache: no a6_encrypted_cache_v*.py found next to this file -- scan not cached.",
+                  file=sys.stderr)
+        else:
+            try:
+                kwargs = {}
+                if args.cache_db:
+                    kwargs["db_path"] = args.cache_db
+                if args.cache_key:
+                    kwargs["key_path"] = args.cache_key
+                with a6.A6Cache(**kwargs) as cache:
+                    scan_id = cache.write_scan(results, source_version=os.path.basename(__file__))
+                print(f"\nCached scan as A6 scan id {scan_id} "
+                      f"({args.cache_db or a6.DEFAULT_DB_PATH})")
+            except ImportError as e:
+                print(f"\n! --cache: {e} -- scan not cached (A1 itself still ran fine).", file=sys.stderr)
+            except Exception as e:
+                print(f"\n! --cache: failed to write to A6: {e} -- scan not cached.", file=sys.stderr)
 
 
 if __name__ == "__main__":
