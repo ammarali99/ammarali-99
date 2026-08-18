@@ -588,12 +588,23 @@ started yet.
 
 ## On the horizon
 
-- **Re-test A1 v0.13.1 / A2 v0.7.2 against Ammar's real hardware** — not
-  yet done since the v0.2.0–v0.6.0 rule/severity changes landed, and now
-  also covers the new `--cache` wiring (A1 writing a real scan into A6,
-  A2 reading it back out and writing findings to A6) on a real machine,
-  not just this sandbox. Flagged as the next real-hardware checkpoint
-  before either module grows further.
+- **`--cache` wiring confirmed on Ammar's real hardware.** Ran
+  `run_scan.bat` (A1 `--cache` then A2 `--cache`) on his actual Windows
+  machine: A1 wrote a real scan into A6 as scan id 1, A2 read it back out
+  of A6 with no `--input`/JSON file involved, evaluated it, and wrote the
+  finding back linked to scan id 1 -- the full write/read/evaluate/
+  write-back round trip works end to end outside this sandbox, not just
+  in it. Also confirmed the v0.2.0 severity-scaling fix is doing its job
+  for real: adapter `Ethernet` was disabled but the internet was
+  confirmed working (Wi-Fi carrying the connection), and it correctly
+  showed as `info`, not `critical`/`warning` -- the exact false-alarm
+  shape Ammar's original hardware test caught.
+- **Still outstanding: the rest of the v0.3.0–v0.6.0 rule set hasn't been
+  exercised on real hardware yet** -- this run only triggered the
+  interface/severity-scaling rule (1 info finding, 0 critical/warning).
+  DNS-not-resolving, firewall correlation (including the v0.6.0 "ALL"
+  blanket-block branch), and the other rules still need a real scenario
+  that actually triggers them before they're considered hardware-checked.
 - Expand the MAC vendor OUI table (known gap, flagged above)
 - Add mDNS and SNMP to A1's discovery methods (currently ARP/ping/hostname/
   port-probe/Wi-Fi only)
