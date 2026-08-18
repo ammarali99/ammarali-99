@@ -263,12 +263,28 @@ actually used — see below). Current version does:
   alongside or instead of `--json`. Dynamically loads whichever
   `a6_encrypted_cache_v*.py` is present rather than hardcoding a version
   (`--cache-db` / `--cache-key` to override A6's default paths)
+- **Real bug (v0.13.1 fix):** found while chasing why `--cache` "kept not
+  working" for Ammar. `a6 = _import_a6()` sat *outside* the try/except
+  meant to catch A6-related failures. `_import_a6()` can itself raise --
+  most likely `ImportError`, since A6's own module-level code does
+  `from cryptography.fernet import Fernet` and re-raises if that package
+  isn't installed/working. With the call outside the try, that exception
+  was completely unhandled: instead of the clean `--cache: ... -- scan
+  not cached` message, A1 crashed with a raw Python traceback -- even
+  though the scan itself had already finished successfully. On Windows
+  this likely showed as the console flashing a wall of text and closing
+  before it could be read. Fixed by moving `_import_a6()` inside the
+  same try block. Reproduced the original crash first (in this sandbox,
+  by shadowing the real `cryptography` package with a stub module that
+  raises `ImportError`, then running `--cache` for real as a subprocess)
+  to confirm it crashed before the fix and prints the clean message
+  after.
 - `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` /
   `--no-firewall` flags to skip slower or internet/LAN-broadcast-touching
   steps
 
-**A2 (Rule Engine) is started (v0.7.1).** Standard-library-only Python,
-in its own file (`a2_rule_engine_v0.7.1.py`), deliberately never importing
+**A2 (Rule Engine) is started (v0.7.2).** Standard-library-only Python,
+in its own file (`a2_rule_engine_v0.7.2.py`), deliberately never importing
 A1's file directly -- it reads the same dict A1's `--json` export produces
 (file-based handoff: A1 writes `--json scan.json`, A2 reads `--input
 scan.json`), so A1 can keep bumping its own version/filename with zero
@@ -302,6 +318,19 @@ changes needed in A2. Current version does:
   straight out of A6 (or a specific one via `--cache-scan-id`), evaluates
   it unchanged, and writes findings back into A6 via `write_findings()`.
   Same dynamic `_import_a6()` loader A1 v0.13.0 uses, for the same reason
+- **Real bug (v0.7.2 fix):** the same class of bug as A1 v0.13.1, found in
+  the same debugging session. `a6 = _import_a6()` and `cache.get_scans()`
+  both sat outside real exception handling -- either one could raise
+  (`ImportError` if `cryptography` isn't installed; `CacheError` on a
+  wrong key or tampered database) and crash A2 with a raw traceback
+  instead of a clean `--cache: ...` message. Rewrote the `--cache` branch
+  so `_import_a6()`, `A6Cache()`, and `get_scans()` are all inside one
+  try -- `cache` is deliberately left open on the success path so
+  `write_findings()` can still use it further down, and only gets closed
+  on each early-failure return. Reproduced the original crash first
+  (shadowing `cryptography` with a stub module that raises `ImportError`,
+  then running `--cache` as a real subprocess), confirmed the crash
+  before the fix and the clean message after.
 - **Severity now scales with actual connectivity impact (v0.2.0), not just
   raw component state.** Ammar's first real-hardware test (Wi-Fi switched
   off in software, but Ethernet was providing a working internet
@@ -469,9 +498,9 @@ that already depended on the JSON files broke. New:
   A2 both stay standard-library-only otherwise, and a scan/evaluation
   still completes normally (with a clear stderr message) if A6 or
   `cryptography` isn't available.
-- Verified end-to-end in this sandbox: `network_discovery_v0.13.0.py
+- Verified end-to-end in this sandbox: `network_discovery_v0.13.1.py
   --cache` wrote a real scan into a fresh A6 database, then
-  `a2_rule_engine_v0.7.1.py --cache` (no `--input` given at all) picked
+  `a2_rule_engine_v0.7.2.py --cache` (no `--input` given at all) picked
   up that exact scan, evaluated it, and wrote the resulting finding back
   linked to the right scan id -- confirmed via A6's own `--list-scans`/
   `--list-findings`. Also re-confirmed `--json` still works unchanged on
@@ -559,7 +588,7 @@ started yet.
 
 ## On the horizon
 
-- **Re-test A1 v0.13.0 / A2 v0.7.1 against Ammar's real hardware** — not
+- **Re-test A1 v0.13.1 / A2 v0.7.2 against Ammar's real hardware** — not
   yet done since the v0.2.0–v0.6.0 rule/severity changes landed, and now
   also covers the new `--cache` wiring (A1 writing a real scan into A6,
   A2 reading it back out and writing findings to A6) on a real machine,

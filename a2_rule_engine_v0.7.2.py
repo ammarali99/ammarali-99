@@ -3,8 +3,32 @@
 a2_rule_engine.py -- Module A2 (Rule Engine) of the offline network
 diagnostic app.
 
-VERSION: 0.7.1
+VERSION: 0.7.2
 CHANGELOG:
+  0.7.2 - Same class of bug as A1 v0.13.1, found in the same debugging
+          session: `a6 = _import_a6()` and `cache.get_scans(...)` both
+          sat outside real exception handling. _import_a6() can raise
+          (ImportError if 'cryptography' isn't installed -- A6's own
+          module-level import fails the instant it's loaded) and so
+          can get_scans() (CacheError on a wrong key or a tampered
+          database). Either one crashed A2 with a raw traceback instead
+          of the clean "--cache: ..." message this was supposed to
+          show.
+
+          Rewrote the --cache branch so _import_a6(), A6Cache(), and
+          get_scans() are all inside one try -- cache is deliberately
+          left open (not closed) on the success path so write_findings()
+          can still use it further down, and only gets closed on each
+          early-failure return.
+
+          Reproduced the original bug first (shadowing 'cryptography'
+          with a stub module that raises ImportError, then running
+          --cache as a real subprocess) to confirm the crash before the
+          fix, and the clean message after. Re-confirmed the full
+          --cache pipeline (A1 write -> A2 read+evaluate+write-back),
+          --input/--json, piped stdin, and the v0.7.1 no-args-on-a-tty
+          fix all still work unchanged.
+
   0.7.1 - Fixed a real bug Ammar hit testing v0.13.0/v0.7.0's new --cache
           wiring: running A2 with no --input, no --cache, and nothing
           piped into it looked like a dead, black cmd window -- no
@@ -204,8 +228,8 @@ CHANGELOG:
 Standard-library only. No pip installs, same reason as A1 -- see CLAUDE.md.
 
 Run it against a saved scan:
-    python3 network_discovery_v0.13.0.py --json scan.json
-    python3 a2_rule_engine_v0.7.1.py --input scan.json
+    python3 network_discovery_v0.13.1.py --json scan.json
+    python3 a2_rule_engine_v0.7.2.py --input scan.json
 
 Note: this has to be a two-step, file-based handoff, not a direct pipe.
 A1's `--json` with no path still prints its normal plain-language output
@@ -214,11 +238,11 @@ A2 hands it a mix of prose and JSON, not valid JSON on its own. Always
 give A1 a real path (`--json scan.json`) when the output is meant for A2.
 
 Dump findings as JSON instead of/alongside the plain-language printout:
-    python3 a2_rule_engine_v0.7.1.py --input scan.json --json findings.json
+    python3 a2_rule_engine_v0.7.2.py --input scan.json --json findings.json
 
 Or skip the JSON file entirely and read/write straight through A6:
-    python3 network_discovery_v0.13.0.py --cache
-    python3 a2_rule_engine_v0.7.1.py --cache
+    python3 network_discovery_v0.13.1.py --cache
+    python3 a2_rule_engine_v0.7.2.py --cache
 """
 
 import argparse
@@ -798,39 +822,55 @@ def main():
     cache = None
     scan_id = None
     if args.cache:
-        a6 = _import_a6()
-        if a6 is None:
-            print("--cache: no a6_encrypted_cache_v*.py found next to this file -- nothing to read.",
-                  file=sys.stderr)
-            return 1
+        # _import_a6() and get_scans() can both raise (ImportError if
+        # 'cryptography' isn't installed -- A6's own module-level import
+        # fails the instant we try to load it; CacheError on a wrong key or
+        # a tampered database). Both have to be inside this try, not just
+        # A6Cache(**kwargs) -- otherwise either one is unhandled and crashes
+        # with a raw traceback instead of the clean message this is meant to
+        # give. cache is deliberately NOT closed here on the success path --
+        # it stays open so write_findings() can use it further down, and
+        # gets closed there (or right here, on any early failure exit).
+        cache = None
         try:
+            a6 = _import_a6()
+            if a6 is None:
+                print("--cache: no a6_encrypted_cache_v*.py found next to this file -- nothing to read.",
+                      file=sys.stderr)
+                return 1
+
             kwargs = {}
             if args.cache_db:
                 kwargs["db_path"] = args.cache_db
             if args.cache_key:
                 kwargs["key_path"] = args.cache_key
             cache = a6.A6Cache(**kwargs)
+
+            # A6 v0.1.0 has no get-scan-by-id lookup, only get_scans(limit=N)
+            # sorted newest-first -- fine for a local single-user cache,
+            # flagged as a known gap to revisit if scan volume ever makes
+            # this worth adding to A6 itself.
+            scans = cache.get_scans(limit=10_000 if args.cache_scan_id is not None else 1)
+            if args.cache_scan_id is not None:
+                scans = [s for s in scans if s["id"] == args.cache_scan_id]
+            if not scans:
+                what = f"scan id {args.cache_scan_id}" if args.cache_scan_id is not None else "any scans"
+                print(f"--cache: A6 has no {what} -- run A1 with --cache first.", file=sys.stderr)
+                cache.close()
+                return 1
+            scan = scans[0]
+            scan_id = scan["id"]
+            data = scan["discovery"]
         except ImportError as e:
             print(f"--cache: {e}", file=sys.stderr)
+            if cache is not None:
+                cache.close()
             return 1
         except Exception as e:
-            print(f"--cache: could not open A6: {e}", file=sys.stderr)
+            print(f"--cache: {e}", file=sys.stderr)
+            if cache is not None:
+                cache.close()
             return 1
-
-        # A6 v0.1.0 has no get-scan-by-id lookup, only get_scans(limit=N) sorted
-        # newest-first -- fine for a local single-user cache, flagged as a known
-        # gap to revisit if scan volume ever makes this worth adding to A6 itself.
-        scans = cache.get_scans(limit=10_000 if args.cache_scan_id is not None else 1)
-        if args.cache_scan_id is not None:
-            scans = [s for s in scans if s["id"] == args.cache_scan_id]
-        if not scans:
-            what = f"scan id {args.cache_scan_id}" if args.cache_scan_id is not None else "any scans"
-            print(f"--cache: A6 has no {what} -- run A1 with --cache first.", file=sys.stderr)
-            cache.close()
-            return 1
-        scan = scans[0]
-        scan_id = scan["id"]
-        data = scan["discovery"]
     else:
         try:
             data = _load_input(args.input)

@@ -3,8 +3,33 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.13.0
+VERSION: 0.13.1
 CHANGELOG:
+  0.13.1 - Real bug, found while chasing down why --cache "kept not
+          working" for Ammar: `a6 = _import_a6()` sat *outside* the
+          try/except that was supposed to catch A6-related failures.
+          _import_a6() can itself raise -- most likely an ImportError,
+          since A6's own module-level code does
+          `from cryptography.fernet import Fernet` and re-raises if
+          that package isn't installed/working. With the call outside
+          the try, that exception was completely unhandled: instead of
+          the clean "--cache: ... -- scan not cached" message this was
+          supposed to show, A1 crashed with a raw Python traceback,
+          even though the scan itself had already finished
+          successfully. On Windows this likely showed as the console
+          window flashing a wall of text and closing before it could
+          be read.
+
+          Fixed by moving _import_a6() inside the same try block as
+          the rest of the --cache logic. Reproduced the original bug
+          first (in this sandbox, by shadowing the real `cryptography`
+          package with a stub module that raises ImportError, then
+          running --cache for real as a subprocess) to confirm it
+          really did crash with a traceback before the fix, and prints
+          the clean message and exits normally after. Re-confirmed the
+          full --cache pipeline, --input/--json, and no-args-on-a-tty
+          (v0.7.1's fix) all still work unchanged.
+
   0.13.0 - Wires A1 into A6 (Encrypted Local Cache) directly, the "small
           plumbing change" CLAUDE.md flagged once A6 existed. New
           `--cache` flag: after a scan, writes the discovery dict
@@ -2526,12 +2551,18 @@ def main():
             print(f"\nWrote JSON results to {args.json}")
 
     if args.cache:
-        a6 = _import_a6()
-        if a6 is None:
-            print("\n! --cache: no a6_encrypted_cache_v*.py found next to this file -- scan not cached.",
-                  file=sys.stderr)
-        else:
-            try:
+        # _import_a6() itself can raise (e.g. ImportError if 'cryptography' isn't
+        # installed -- A6's own module-level import fails the moment we try to
+        # load it) so it has to be inside this try too, not just the A6Cache
+        # calls below it -- otherwise that exception is unhandled and crashes
+        # A1 with a raw traceback instead of the clean message this is meant
+        # to give, even though the scan itself already finished successfully.
+        try:
+            a6 = _import_a6()
+            if a6 is None:
+                print("\n! --cache: no a6_encrypted_cache_v*.py found next to this file -- scan not cached.",
+                      file=sys.stderr)
+            else:
                 kwargs = {}
                 if args.cache_db:
                     kwargs["db_path"] = args.cache_db
@@ -2541,10 +2572,10 @@ def main():
                     scan_id = cache.write_scan(results, source_version=os.path.basename(__file__))
                 print(f"\nCached scan as A6 scan id {scan_id} "
                       f"({args.cache_db or a6.DEFAULT_DB_PATH})")
-            except ImportError as e:
-                print(f"\n! --cache: {e} -- scan not cached (A1 itself still ran fine).", file=sys.stderr)
-            except Exception as e:
-                print(f"\n! --cache: failed to write to A6: {e} -- scan not cached.", file=sys.stderr)
+        except ImportError as e:
+            print(f"\n! --cache: {e} -- scan not cached (A1 itself still ran fine).", file=sys.stderr)
+        except Exception as e:
+            print(f"\n! --cache: failed to write to A6: {e} -- scan not cached.", file=sys.stderr)
 
 
 if __name__ == "__main__":
