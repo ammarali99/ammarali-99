@@ -3,8 +3,39 @@
 a6_encrypted_cache.py -- Module A6 (Encrypted local cache) of the offline
 network diagnostic app.
 
-VERSION: 0.1.0
+VERSION: 0.2.0
 CHANGELOG:
+  0.2.0 - Adds a `snapshots` table for A4 (Snapshot/Rollback Manager),
+          the next module now being built. Same reasoning as v0.1.0's
+          own scope decision: only add a table when the module that
+          needs it actually exists, not ahead of time.
+
+          Schema mirrors `findings`: `target` (e.g. an interface name
+          like "Ethernet") and `snapshot_type` (e.g.
+          "interface_admin_state") stay in the clear -- non-sensitive,
+          and A4 needs to filter "give me the latest snapshot for this
+          interface" without decrypting every row. `restored_at` also
+          stays in the clear (NULL until a restore actually happens) so
+          it's easy to see at a glance which snapshots were ever used.
+          Everything else -- the actual captured state dict, and the
+          human-readable `reason` a snapshot was taken -- goes into one
+          encrypted BLOB column, same as a finding's target/summary/
+          detail/evidence.
+
+          New API: `write_snapshot()`, `get_snapshots()` (filterable by
+          target/snapshot_type), `get_snapshot(id)` (direct lookup by
+          id -- A4's restore/verify functions need to fetch one exact
+          snapshot, not filter a list client-side the way A2 v0.7.0 had
+          to work around A6 not having this for scans). New CLI:
+          `--list-snapshots`, `--target` filter.
+
+          Verified: wrote a throwaway snapshot with a canary string via
+          `write_snapshot()`, read it back via both `get_snapshots()`
+          and `get_snapshot(id)`, confirmed both decrypt correctly and
+          the raw `.db` bytes don't contain the canary -- same
+          encryption sanity check `--selftest` already does for scans/
+          findings, now covering the new table too.
+
   0.1.0 - First version. Every other module is supposed to write here
           first (see CLAUDE.md's architecture table), so this starts with
           just the two things that actually exist so far: A1's scan
@@ -124,6 +155,18 @@ CREATE INDEX IF NOT EXISTS idx_findings_scan_id ON findings(scan_id);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
 CREATE INDEX IF NOT EXISTS idx_findings_category ON findings(category);
 CREATE INDEX IF NOT EXISTS idx_findings_finding_id ON findings(finding_id);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    target TEXT NOT NULL,
+    snapshot_type TEXT NOT NULL,
+    restored_at TEXT,
+    payload BLOB NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_target ON snapshots(target);
+CREATE INDEX IF NOT EXISTS idx_snapshots_type ON snapshots(snapshot_type);
 """
 
 
@@ -250,6 +293,63 @@ class A6Cache:
             })
         return results
 
+    def write_snapshot(self, target, snapshot_type, state, reason=None, created_at=None):
+        """
+        Stores one point-in-time capture of local state (e.g. one
+        interface's admin_enabled/connected/mtu) before something is
+        about to change it. Returns the new snapshot's id.
+        """
+        created_at = created_at or datetime.now(timezone.utc).isoformat()
+        payload = self._encrypt({"state": state, "reason": reason})
+        cur = self._conn.execute(
+            "INSERT INTO snapshots (created_at, target, snapshot_type, payload) "
+            "VALUES (?, ?, ?, ?)",
+            (created_at, target, snapshot_type, payload),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def get_snapshot(self, snapshot_id):
+        """Direct lookup by id. Returns None if no such snapshot exists."""
+        row = self._conn.execute(
+            "SELECT id, created_at, target, snapshot_type, restored_at, payload "
+            "FROM snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._snapshot_row_to_dict(row)
+
+    def get_snapshots(self, target=None, snapshot_type=None, limit=10):
+        query = (
+            "SELECT id, created_at, target, snapshot_type, restored_at, payload "
+            "FROM snapshots WHERE 1=1"
+        )
+        params = []
+        for column, value in (("target", target), ("snapshot_type", snapshot_type)):
+            if value is not None:
+                query += f" AND {column} = ?"
+                params.append(value)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        return [self._snapshot_row_to_dict(r) for r in self._conn.execute(query, params).fetchall()]
+
+    def _snapshot_row_to_dict(self, row):
+        decrypted = self._decrypt(row[5])
+        return {
+            "id": row[0], "created_at": row[1], "target": row[2], "snapshot_type": row[3],
+            "restored_at": row[4], "state": decrypted["state"], "reason": decrypted["reason"],
+        }
+
+    def mark_snapshot_restored(self, snapshot_id, restored_at=None):
+        restored_at = restored_at or datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "UPDATE snapshots SET restored_at = ? WHERE id = ?",
+            (restored_at, snapshot_id),
+        )
+        self._conn.commit()
+
     def close(self):
         self._conn.close()
 
@@ -262,16 +362,24 @@ class A6Cache:
 
 def _selftest(db_path, key_path):
     """
-    Writes a throwaway scan+finding, reads them back, and checks the raw
-    .db file bytes don't contain the plaintext -- a sanity check that
-    encryption is actually happening, not a no-op.
+    Writes a throwaway scan+finding+snapshot, reads them back, and checks
+    the raw .db file bytes don't contain the plaintext -- a sanity check
+    that encryption is actually happening, not a no-op.
     """
     if Path(db_path).exists() or Path(key_path).exists():
         print(f"Refusing to self-test over an existing {db_path}/{key_path} -- "
               "pass --db/--key pointing at throwaway paths.", file=sys.stderr)
         return 1
 
+    # Two markers, deliberately: `secret_marker` only ever goes into columns
+    # this file documents as encrypted, so it must never appear in the raw
+    # .db bytes. `plain_marker` goes into columns documented as plaintext
+    # by design (finding_id/rule_id/category/severity/fix_classification/
+    # detected_at/source_version/scanned_at, and a snapshot's target/
+    # snapshot_type) -- those are *supposed* to be readable in the raw
+    # file, so checking for plain_marker would be testing the wrong thing.
     secret_marker = "SELFTEST-CANARY-f3a9c2"
+    plain_marker = "selftest-plain-ok-to-leak"
     try:
         with A6Cache(db_path, key_path) as cache:
             scan_id = cache.write_scan(
@@ -285,12 +393,20 @@ def _selftest(db_path, key_path):
                 "fix_classification": "not-fixable", "evidence": {"marker": secret_marker},
                 "detected_at": datetime.now(timezone.utc).isoformat(),
             }], scan_id=scan_id)
+            snapshot_id = cache.write_snapshot(
+                target=plain_marker, snapshot_type="selftest",
+                state={"admin_enabled": True, "marker": secret_marker}, reason=secret_marker,
+            )
 
             scans = cache.get_scans(limit=1)
             findings = cache.get_findings(scan_id=scan_id)
+            snapshot = cache.get_snapshot(snapshot_id)
 
         assert scans[0]["discovery"]["canary"] == secret_marker, "scan round-trip mismatch"
         assert findings[0]["target"] == secret_marker, "finding round-trip mismatch"
+        assert snapshot["target"] == plain_marker, "snapshot round-trip mismatch"
+        assert snapshot["reason"] == secret_marker, "snapshot reason round-trip mismatch"
+        assert snapshot["state"]["marker"] == secret_marker, "snapshot state round-trip mismatch"
 
         raw_bytes = Path(db_path).read_bytes()
         if secret_marker.encode() in raw_bytes:
@@ -298,8 +414,8 @@ def _selftest(db_path, key_path):
                   "encryption is not actually protecting this data.", file=sys.stderr)
             return 1
 
-        print("PASS: wrote+read back a scan and finding correctly, and the raw .db file "
-              "does not contain the plaintext canary.")
+        print("PASS: wrote+read back a scan, finding, and snapshot correctly, and the raw "
+              ".db file does not contain the plaintext canary.")
         return 0
     finally:
         for p in (db_path, key_path):
@@ -321,9 +437,11 @@ def main():
     parser.add_argument("--scan-id", type=int, default=None, help="Attach --import-findings to this scan id")
     parser.add_argument("--list-scans", action="store_true", help="List recent scans")
     parser.add_argument("--list-findings", action="store_true", help="List findings")
+    parser.add_argument("--list-snapshots", action="store_true", help="List snapshots")
     parser.add_argument("--severity", default=None, help="Filter --list-findings by severity")
     parser.add_argument("--category", default=None, help="Filter --list-findings by category")
-    parser.add_argument("--limit", type=int, default=10, help="Row limit for --list-scans (default 10)")
+    parser.add_argument("--target", default=None, help="Filter --list-snapshots by target (e.g. an interface name)")
+    parser.add_argument("--limit", type=int, default=10, help="Row limit for --list-scans/--list-snapshots (default 10)")
     parser.add_argument("--selftest", action="store_true",
                          help="Run a throwaway round-trip + encryption sanity check and exit")
     args = parser.parse_args()
@@ -366,6 +484,16 @@ def main():
                 for f in findings:
                     print(f"[{f['severity'].upper():<8}] scan={f['scan_id']} {f['category']:<10} "
                           f"{f['target']:<15} {f['summary']}")
+
+            if args.list_snapshots:
+                did_something = True
+                snaps = cache.get_snapshots(target=args.target, limit=args.limit)
+                if not snaps:
+                    print("No snapshots match.")
+                for s in snaps:
+                    restored = f"restored {s['restored_at']}" if s["restored_at"] else "not restored"
+                    print(f"[{s['id']}] {s['created_at']}  {s['snapshot_type']:<24} "
+                          f"target={s['target']:<12} {restored}")
     except CacheError as e:
         print(f"Cache error: {e}", file=sys.stderr)
         return 1

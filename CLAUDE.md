@@ -425,11 +425,11 @@ changes needed in A2. Current version does:
   real hardware again to confirm the v0.2.0 through v0.6.0 changes, then
   expand the rule set further
 
-**A6 (Encrypted local cache) is started (v0.1.0).** Own file
-(`a6_encrypted_cache_v0.1.0.py`). Handles the two things that actually
-exist so far -- A1 scans and A2 findings -- rather than pre-building
-tables for fix_outcomes/snapshots/AI suggestions/reports before A3/A4/AI1/
-A5 exist to write them. Current version does:
+**A6 (Encrypted local cache) is started (v0.2.0).** Own file
+(`a6_encrypted_cache_v0.2.0.py`). Handles what actually exists so far --
+A1 scans, A2 findings, and (new in v0.2.0) A4 snapshots -- rather than
+pre-building tables for fix_outcomes/AI suggestions/reports before
+A3/AI1/A5 exist to write them. Current version does:
 
 - SQLite for storage, `cryptography` (Fernet/AES-128-CBC+HMAC) for
   encryption at rest -- Python's standard library has no safe symmetric
@@ -467,6 +467,16 @@ A5 exist to write them. Current version does:
 - `write_scan()` / `write_findings()` / `get_scans()` / `get_findings()`
   (filterable by scan/severity/category/fix_classification) as the
   Python API.
+- **New in v0.2.0, for A4:** `write_snapshot()` / `get_snapshots()`
+  (filterable by target/snapshot_type) / `get_snapshot(id)` (direct
+  lookup by id -- A2 v0.7.0 had to work around A6 not having this for
+  scans; A4's restore/verify functions need to fetch one exact snapshot,
+  so this version adds it properly) / `mark_snapshot_restored()`. Same
+  plaintext/encrypted split as findings: a snapshot's `target` (e.g. an
+  interface name) and `snapshot_type` stay in the clear for filtering;
+  the actual captured state and the human-readable `reason` a snapshot
+  was taken go into one encrypted BLOB. `--selftest` now also covers the
+  snapshots table with its own canary check.
 - CLI is a bridge, not the final design: `--import-scan` / `--import-
   findings` read A1's/A2's existing `--json` exports, so the whole
   encrypt/store/retrieve path is testable today without changing A1/A2
@@ -523,7 +533,86 @@ that already depended on the JSON files broke. New:
   prints the message and exits immediately. Re-confirmed `--input`,
   `--cache`, and piped stdin all still work unchanged.
 
-Everything else (A3, A4, A5, A7, the Credential Manager, AI1) is not
+**A4 (Snapshot/Rollback Manager) is started (v0.1.0).** Own file
+(`a4_snapshot_rollback_v0.1.0.py`). Built before A3 on purpose --
+CLAUDE.md already called this order out ("rollback has to exist before
+anything is allowed to touch a device's config"), and A3 doesn't exist
+yet, so this version is built to be fully testable standalone: take a
+snapshot, break something, restore it, verify the restore -- all without
+needing a fix engine to drive it. Current version does:
+
+- **Scope, deliberately narrow for v1: this machine's own network
+  settings only, not router config**, and within that, only one thing --
+  an interface's `admin_enabled` state (enabled/disabled). That's the
+  exact finding that's already fired for real on Ammar's hardware (a
+  disabled Ethernet adapter). Two other candidates were considered and
+  deliberately left out rather than guessed at:
+    - **DNS servers** -- A1's `get_dns_servers()` reads DNS as one flat
+      list across the whole machine, not per-interface, so there's no
+      way yet to know which interface a given server belongs to. That's
+      an A1 change first, not something to fake here.
+    - **Wi-Fi radio software on/off** -- A1's own `get_wifi_radio_state()`
+      already explains why it won't touch Windows' real Airplane Mode
+      flag; there's no clean, documented command to *set* the software
+      radio state back either (unlike `admin_enabled`, which
+      `netsh interface set` does support). A confidently-wrong restore
+      is worse than not having the feature -- same reasoning A1 already
+      used for the read side.
+  Router-side snapshot/restore is blocked on the same thing web-UI
+  scraping already is: no point building rollback for something A3
+  can't touch until the Credential Manager exists.
+- Reuses A1 and A6 by dynamically loading whichever
+  `network_discovery_v*.py` / `a6_encrypted_cache_v*.py` sits next to
+  this file -- same version-decoupling trick A1/A2 already use for A6.
+  Every dynamic-import call is wrapped immediately in `_load_a1()` /
+  `_load_a6_cache()`, which convert any failure into a clear `A4Error`
+  -- applying the exact fix A1 v0.13.1/A2 v0.7.2 needed *from the
+  start*, instead of shipping the same bug a third time.
+- macOS needs its own small `_macos_service_name_for_interface()`
+  lookup: A1's macOS code only keeps the wifi/ethernet *type* per
+  interface, not the actual "Hardware Port" name (e.g. "Wi-Fi",
+  "Thunderbolt Ethernet") that `networksetup -setnetworkserviceenabled`
+  needs as an argument.
+- `take_snapshot()` / `restore_snapshot()` /
+  `verify_reachability_and_maybe_rollback()` as the Python API (for A3
+  to call later). Every restore is **idempotent** (already-correct state
+  -> no-op, reported as such) and **verifies the OS actually applied the
+  change** before reporting success, rather than trusting a command's
+  exit code alone.
+- **Real bug caught by testing, fixed before it shipped:**
+  `verify_reachability_and_maybe_rollback()` originally decided
+  "unreachable" from gateway ping loss alone. Testing in this sandbox
+  caught a live false positive -- ICMP to the gateway was blocked (100%
+  "loss") even though the internet was completely fine (confirmed by
+  `check_internet_reachability()` succeeding at the same time). Deciding
+  on ping loss alone would auto-rollback a working connection just
+  because ICMP happens to be filtered -- the same confident-false-alarm
+  shape A2's `_connectivity_context()` (v0.2.0) already exists to avoid
+  for severity, except here a false positive doesn't just misreport
+  something, it takes a real action. Fixed: `internet_reachable` (A1's
+  TCP-connect check) is now the deciding signal; gateway ping loss is
+  still reported for diagnostics but doesn't trigger a rollback by
+  itself.
+- CLI: `--snapshot INTERFACE [--reason TEXT]`, `--restore ID`,
+  `--verify-and-rollback ID`, `--list-snapshots [--target NAME]`, plus
+  `--cache-db`/`--cache-key` overrides matching A1/A2's existing flag
+  names.
+- Verified in this sandbox on Linux against a real (virtual, throwaway)
+  network interface -- a `veth` pair created specifically so testing
+  never touched this session's actual connectivity: took a snapshot
+  while up, took the interface down manually, restored it via A4,
+  confirmed `admin_enabled` matched the snapshot again. Confirmed the
+  idempotent no-op restore path, and (via a safe mock of A1's
+  reachability check, not by actually breaking real networking) both
+  branches of `verify_reachability_and_maybe_rollback()` -- rolls back
+  when genuinely unreachable, leaves things alone when still reachable.
+  Error paths (unknown interface, unknown snapshot id) tested too.
+  **Windows/macOS command paths follow A1's own established read-side
+  commands exactly but are not yet verified on real hardware** -- same
+  honesty convention A1 already applies to its own unverified platform
+  paths.
+
+Everything else (A3, A5, A7, the Credential Manager, AI1) is not
 started yet.
 
 ## Flagged / open decisions
@@ -605,13 +694,25 @@ started yet.
   DNS-not-resolving, firewall correlation (including the v0.6.0 "ALL"
   blanket-block branch), and the other rules still need a real scenario
   that actually triggers them before they're considered hardware-checked.
+- **Re-test A4 v0.1.0 against Ammar's real Windows hardware** — verified
+  in this sandbox against a real Linux virtual interface, but the
+  Windows `netsh interface set interface admin=enable/disable` command
+  path (what Ammar will actually use) is not yet confirmed on real
+  hardware. Needs an elevated (Administrator) Command Prompt to work at
+  all — worth confirming that requirement surfaces a clear error if
+  forgotten, not a silent failure.
+- Now that A4 exists, **A3 (Fix Engine) is next** — it can finally call
+  something real for rollback instead of touching device config with no
+  safety net.
+- Expand A4 beyond interface admin_enabled once the prerequisites it's
+  currently blocked on are addressed: per-interface DNS tracking in A1
+  (needed before DNS restore is possible), and a real Windows-verified
+  Wi-Fi-radio set path if one turns out to exist safely.
 - Expand the MAC vendor OUI table (known gap, flagged above)
 - Add mDNS and SNMP to A1's discovery methods (currently ARP/ping/hostname/
   port-probe/Wi-Fi only)
 - Expand A2's rule set further, once the real-hardware retest confirms the
   current rules
-- A4 (Snapshot/Rollback) before A3 (Fix Engine) — rollback has to exist
-  before anything is allowed to touch a device's config
 - AI layer (AI1) stays deferred until after a working core (A1-A7 minus AI1)
   exists end-to-end
 - Cloud backend (FastAPI + PostgreSQL) is last — it's opportunistic/optional
