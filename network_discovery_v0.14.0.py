@@ -3,8 +3,54 @@
 network_discovery.py -- Module A1 (Discovery) of the offline network
 diagnostic app.
 
-VERSION: 0.13.1
+VERSION: 0.14.0
 CHANGELOG:
+  0.14.0 - New get_interface_network_config(): per-interface DNS
+          servers, IP assignment mode, and (when static) the actual
+          static IP/subnet/gateway -- one dict per interface, keyed by
+          the same interface names get_interface_status() already
+          uses. Needed for A4's expanded diff-and-rollback work:
+          get_dns_servers() reads DNS as one flat list across the whole
+          machine, and get_ip_assignment_mode() only returns a mode
+          label for one IP, neither of which is enough to know *which*
+          interface's DNS to restore, or what static values to restore
+          it to. Both existing functions are unchanged and still used
+          exactly as before -- this is a new, additive function, not a
+          replacement, so nothing that already depended on the old
+          shape breaks.
+
+          On Windows this is one pass over `ipconfig /all`: each
+          adapter's block already has DNS servers, DHCP Enabled, IPv4
+          Address, Subnet Mask, and Default Gateway together, so it's
+          captured in a single parse instead of three separate ones.
+          On Linux, per-device via `nmcli device show` (IP4.DNS,
+          IP4.ADDRESS, IP4.GATEWAY) plus the connection's ipv4.method
+          for the mode -- same NetworkManager-only limitation
+          get_ip_assignment_mode() already has; an interface nmcli
+          doesn't manage just doesn't appear, rather than guessing
+          wrong. Also captures `connection_name` (the nmcli connection
+          id, e.g. "Wired connection 1") on Linux, and the networksetup
+          service name on macOS -- A4's DNS/static-mode set commands
+          need to address the *connection*, not just the device, on
+          both platforms. On macOS, `networksetup -getinfo <service>`
+          for IP/mask/gateway/mode plus `-getdnsservers <service>` for
+          DNS -- flagged as not yet verified on real macOS hardware,
+          and `-getdnsservers` specifically only shows manually-set DNS
+          overrides, not DHCP-provided ones (a real limitation of that
+          command, not a parsing gap).
+
+          Verification, stated honestly: this sandbox's NetworkManager
+          wouldn't cooperate (container-specific `managed=false` default
+          fighting a live managed test interface -- fixable in principle,
+          not worth the fight for this), so the Linux/Windows/macOS
+          parsers were each verified by feeding them realistic captured
+          command output (real `nmcli -t` terse format, real `ipconfig
+          /all` block structure, real `networksetup -getinfo` layout)
+          and checking the parsed result field-by-field, rather than
+          against a live managed interface. That's weaker than this
+          codebase's usual real-hardware bar and is flagged as such --
+          not claimed as more than it is.
+
   0.13.1 - Real bug, found while chasing down why --cache "kept not
           working" for Ammar: `a6 = _import_a6()` sat *outside* the
           try/except that was supposed to catch A6-related failures.
@@ -981,6 +1027,242 @@ def get_ip_assignment_mode(local_ip):
         errors.append(f"unexpected error checking dhcp/static: {e}")
 
     return "unknown", errors
+
+
+def _macos_hardware_ports():
+    """
+    All (device, hardware-port-name) pairs from `networksetup
+    -listallhardwareports`, e.g. [("en0", "Wi-Fi"), ("en1", "Thunderbolt
+    Ethernet")]. Unlike _macos_interface_types() (which keeps only a
+    normalized wifi/ethernet type), this keeps the actual port name --
+    the exact string networksetup's other commands (-getinfo,
+    -getdnsservers, -setdnsservers, -setnetworkserviceenabled) need as
+    an argument.
+    """
+    pairs = []
+    try:
+        out = subprocess.check_output(["networksetup", "-listallhardwareports"], text=True)
+        for block in out.split("\n\n"):
+            port_m = re.search(r"Hardware Port: (.+)", block)
+            dev_m = re.search(r"Device: (\w+)", block)
+            if port_m and dev_m:
+                pairs.append((dev_m.group(1), port_m.group(1).strip()))
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        pass
+    return pairs
+
+
+def get_interface_network_config():
+    """
+    Per-interface DNS servers, IP assignment mode, and (when static) the
+    actual static IP/subnet/gateway -- everything A4 needs to later
+    detect and revert a DNS or static/DHCP change on a specific
+    interface. Deliberately separate from get_dns_servers() and
+    get_ip_assignment_mode() (both stay unchanged, machine-wide/single-IP
+    as before) rather than replacing them -- existing A2 rules and
+    existing scans keep working exactly as before; this is additive.
+
+    Returns ({interface_name: {"dns_servers": [...], "ip_assignment_mode":
+    "dhcp"/"static"/"unknown", "ip_address": str|None, "subnet_mask":
+    str|None, "gateway": str|None}}, errors).
+
+    Known gap, same shape as get_ip_assignment_mode()'s existing one:
+    on Linux, an interface not managed by NetworkManager just doesn't
+    appear in the result, rather than guessing wrong.
+    """
+    config = {}
+    errors = []
+    try:
+        if SYSTEM == "Windows":
+            try:
+                result = subprocess.run(["ipconfig", "/all"], capture_output=True, text=True, errors="ignore", timeout=10)
+            except FileNotFoundError:
+                errors.append("ipconfig not found (unexpected on Windows)")
+                return config, errors
+            if result.returncode != 0:
+                errors.append(f"ipconfig /all failed: {(result.stderr or result.stdout).strip()}")
+                return config, errors
+
+            # One pass over ipconfig /all: each adapter's block has DNS
+            # servers, DHCP Enabled, IPv4 Address, Subnet Mask, and
+            # Default Gateway all together, so this captures everything
+            # per interface in a single parse instead of three.
+            current = None
+            in_dns_block = False
+            for line in result.stdout.splitlines():
+                header_m = re.match(
+                    r"^(?:Ethernet adapter|Wireless LAN adapter|Tunnel adapter|Unknown adapter) (.+):\s*$",
+                    line,
+                )
+                if header_m:
+                    current = header_m.group(1).strip()
+                    config[current] = {
+                        "dns_servers": [], "ip_assignment_mode": "unknown",
+                        "ip_address": None, "subnet_mask": None, "gateway": None,
+                        "connection_name": None,
+                    }
+                    in_dns_block = False
+                    continue
+                if current is None:
+                    continue
+                stripped = line.strip()
+
+                if stripped.startswith("DNS Servers"):
+                    m = re.search(r":\s*([\d.]+)\s*$", stripped)
+                    if m:
+                        config[current]["dns_servers"].append(m.group(1))
+                    in_dns_block = True
+                    continue
+                if in_dns_block and re.match(r"^\d{1,3}(\.\d{1,3}){3}$", stripped):
+                    config[current]["dns_servers"].append(stripped)
+                    continue
+                in_dns_block = False
+
+                m = re.search(r"DHCP Enabled[.\s]*:\s*(Yes|No)", stripped)
+                if m:
+                    config[current]["ip_assignment_mode"] = "dhcp" if m.group(1) == "Yes" else "static"
+                    continue
+                m = re.search(r"IPv4 Address[.\s]*:\s*([\d.]+)", stripped)
+                if m:
+                    config[current]["ip_address"] = m.group(1)
+                    continue
+                m = re.search(r"Subnet Mask[.\s]*:\s*([\d.]+)", stripped)
+                if m:
+                    config[current]["subnet_mask"] = m.group(1)
+                    continue
+                m = re.search(r"Default Gateway[.\s]*:\s*([\d.]+)", stripped)
+                if m:
+                    config[current]["gateway"] = m.group(1)
+                    continue
+
+            if not config:
+                errors.append("ipconfig /all ran but no adapter blocks were recognized")
+
+        elif SYSTEM == "Linux":
+            try:
+                devices = subprocess.run(
+                    ["nmcli", "-t", "-f", "DEVICE,STATE", "device"],
+                    capture_output=True, text=True, errors="ignore", timeout=10,
+                )
+            except FileNotFoundError:
+                errors.append("nmcli not installed -- per-interface network config needs NetworkManager")
+                return config, errors
+            if devices.returncode != 0:
+                errors.append(f"nmcli device failed: {(devices.stderr or devices.stdout).strip()}")
+                return config, errors
+
+            for line in devices.stdout.splitlines():
+                parts = line.split(":")
+                if len(parts) != 2 or parts[1] != "connected":
+                    continue
+                iface = parts[0]
+                show = subprocess.run(
+                    ["nmcli", "-t", "-f",
+                     "IP4.DNS,IP4.ADDRESS,IP4.GATEWAY,GENERAL.CONNECTION",
+                     "device", "show", iface],
+                    capture_output=True, text=True, errors="ignore", timeout=10,
+                )
+                if show.returncode != 0:
+                    errors.append(f"nmcli device show {iface} failed: {(show.stderr or show.stdout).strip()}")
+                    continue
+
+                entry = {"dns_servers": [], "ip_assignment_mode": "unknown",
+                         "ip_address": None, "subnet_mask": None, "gateway": None,
+                         "connection_name": None}
+                conn_name = None
+                for dline in show.stdout.splitlines():
+                    m = re.match(r"IP4\.DNS\[\d+\]:(.+)", dline)
+                    if m:
+                        entry["dns_servers"].append(m.group(1).strip())
+                        continue
+                    m = re.match(r"IP4\.ADDRESS\[\d+\]:([\d.]+)/(\d+)", dline)
+                    if m:
+                        entry["ip_address"] = m.group(1)
+                        entry["subnet_mask"] = _cidr_to_netmask(int(m.group(2)))
+                        continue
+                    m = re.match(r"IP4\.GATEWAY:(.+)", dline)
+                    if m and m.group(1).strip():
+                        entry["gateway"] = m.group(1).strip()
+                        continue
+                    m = re.match(r"GENERAL\.CONNECTION:(.+)", dline)
+                    if m:
+                        conn_name = m.group(1).strip()
+
+                entry["connection_name"] = conn_name
+                if conn_name:
+                    method_out = subprocess.run(
+                        ["nmcli", "-t", "-f", "ipv4.method", "con", "show", conn_name],
+                        capture_output=True, text=True, errors="ignore", timeout=10,
+                    )
+                    method = method_out.stdout.strip().split(":")[-1]
+                    if method == "auto":
+                        entry["ip_assignment_mode"] = "dhcp"
+                    elif method == "manual":
+                        entry["ip_assignment_mode"] = "static"
+                    else:
+                        errors.append(f"nmcli reported ipv4.method={method!r} for {iface}, not auto/manual")
+
+                config[iface] = entry
+
+            if not config:
+                errors.append("nmcli ran but reported no connected devices")
+
+        elif SYSTEM == "Darwin":
+            for device, service in _macos_hardware_ports():
+                entry = {"dns_servers": [], "ip_assignment_mode": "unknown",
+                         "ip_address": None, "subnet_mask": None, "gateway": None,
+                         "connection_name": service}
+
+                dns_out = subprocess.run(
+                    ["networksetup", "-getdnsservers", service],
+                    capture_output=True, text=True, errors="ignore", timeout=10,
+                )
+                # -getdnsservers only ever shows manually-set DNS overrides,
+                # not DHCP-provided ones -- "There aren't any..." means
+                # either no override or the interface is inactive, not
+                # necessarily "no DNS at all". Not yet verified on real
+                # macOS hardware.
+                entry["dns_servers"] = [
+                    l.strip() for l in dns_out.stdout.splitlines()
+                    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", l.strip())
+                ]
+
+                info_out = subprocess.run(
+                    ["networksetup", "-getinfo", service],
+                    capture_output=True, text=True, errors="ignore", timeout=10,
+                )
+                info = info_out.stdout
+                if "DHCP Configuration" in info:
+                    entry["ip_assignment_mode"] = "dhcp"
+                elif "Manually" in info:
+                    entry["ip_assignment_mode"] = "static"
+                m = re.search(r"IP address:\s*([\d.]+)", info)
+                if m:
+                    entry["ip_address"] = m.group(1)
+                m = re.search(r"Subnet mask:\s*([\d.]+)", info)
+                if m:
+                    entry["subnet_mask"] = m.group(1)
+                m = re.search(r"Router:\s*([\d.]+)", info)
+                if m:
+                    entry["gateway"] = m.group(1)
+
+                if entry["ip_address"]:
+                    config[device] = entry
+
+            if not config:
+                errors.append("networksetup ran but no active hardware ports were found")
+    except Exception as e:
+        errors.append(f"unexpected error reading per-interface network config: {e}")
+
+    return config, errors
+
+
+def _cidr_to_netmask(prefix_len):
+    """25 -> '255.255.255.128', etc. Used to turn nmcli's CIDR-style
+    IP4.ADDRESS (e.g. 192.168.1.100/24) into a plain dotted subnet mask,
+    matching the shape Windows/macOS report it in."""
+    mask = (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
+    return ".".join(str((mask >> shift) & 0xFF) for shift in (24, 16, 8, 0))
 
 
 def _ping_once(ip, timeout_ms=1000):
@@ -2356,6 +2638,10 @@ def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False, skip_u
         mtu = f"mtu={iface['mtu']}" if iface["mtu"] else "mtu=?"
         print(f"  {iface['name']:<12} type={iface['type']:<9} {admin:<10} {conn:<16} {mtu}")
 
+    iface_net_config, iface_net_config_errors = get_interface_network_config()
+    for err in iface_net_config_errors:
+        print(f"  ! {err}")
+
     wifi_radio, wifi_radio_errors = get_wifi_radio_state()
     if wifi_radio["hardware"] or wifi_radio["software"]:
         print(f"  Wi-Fi radio: hardware={wifi_radio['hardware'] or '?'} software={wifi_radio['software'] or '?'}")
@@ -2497,6 +2783,8 @@ def run_discovery(skip_ports=False, skip_wifi=False, skip_internet=False, skip_u
         "dns_scan_errors": dns_errors,
         "interfaces": interfaces,
         "interface_scan_errors": iface_errors,
+        "interface_network_config": iface_net_config,
+        "interface_network_config_errors": iface_net_config_errors,
         "wifi_radio_state": wifi_radio,
         "wifi_radio_errors": wifi_radio_errors,
         "pool_usage": pool_usage,

@@ -30,6 +30,12 @@ CHANGELOG:
           round-trip correctly and the canary still never appears in
           plaintext.
 
+          Also adds a `finding_id` filter to `get_findings()`, needed
+          by A4's new `fix_firewall_rule()` to look up one specific
+          finding (a stable hash, so it can recur across scans --
+          filtering plus the existing newest-first ordering naturally
+          picks the most recent occurrence).
+
   0.2.0 - Adds a `snapshots` table for A4 (Snapshot/Rollback Manager),
           the next module now being built. Same reasoning as v0.1.0's
           own scope decision: only add a table when the module that
@@ -305,7 +311,8 @@ class A6Cache:
             "discovery": self._decrypt(row[3]),
         }
 
-    def get_findings(self, scan_id=None, severity=None, category=None, fix_classification=None):
+    def get_findings(self, scan_id=None, severity=None, category=None,
+                      fix_classification=None, finding_id=None):
         query = (
             "SELECT id, scan_id, finding_id, rule_id, category, severity, "
             "fix_classification, detected_at, payload FROM findings WHERE 1=1"
@@ -314,6 +321,7 @@ class A6Cache:
         for column, value in (
             ("scan_id", scan_id), ("severity", severity),
             ("category", category), ("fix_classification", fix_classification),
+            ("finding_id", finding_id),
         ):
             if value is not None:
                 query += f" AND {column} = ?"
