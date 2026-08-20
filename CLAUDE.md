@@ -649,6 +649,32 @@ started yet.
   that works everywhere. Deferred until the Credential Manager exists —
   no point building something that needs a stored router login before
   there's a safe place to keep one.
+- **Router/device-side fix and rollback (A3 and A4 both) needs to cover
+  two genuinely different device classes, not just consumer routers —
+  flagged, not built.** Ammar's explicit ask: A4 should eventually be
+  able to snapshot/rollback issues caused by the router itself, not only
+  this machine's own settings, and the same is true for A3's fixes. That
+  splits into two different mechanisms, matching the existing
+  Tenda/TP-Link vs. MikroTik/Cisco distinction in Working Conventions
+  below:
+    - **Consumer (Tenda, TP-Link):** the web-UI scraping approach flagged
+      directly above — no clean API, per-model reverse engineering,
+      *guided*-fix UX since access is limited (per Business Context: this
+      segment needs assistive UX, not full automation).
+    - **Managed (MikroTik, Cisco):** a real, documented API/SSH interface
+      instead of scraping (MikroTik's RouterOS API; Cisco depending on
+      platform — SSH/CLI, NETCONF, or REST). Technically more
+      straightforward than the consumer path once credentials exist, and
+      *full automation* is reasonable here (per Working Conventions) —
+      a plausible actual A3/A4 v2 candidate once the Credential Manager
+      exists, likely before the harder consumer web-UI work.
+  Both branches share the same blocker: neither can start before the
+  Credential Manager exists, and A4's snapshot/rollback side specifically
+  needs a way to read a device's current config *before* a fix and
+  restore it after, which for managed devices likely means exporting the
+  running config via the same API/SSH path (e.g., MikroTik's
+  `/export`-style config dump) rather than the individual-setting
+  read/write A4 v1 does for this machine's own interfaces.
 
 ## Working conventions
 
@@ -703,7 +729,11 @@ started yet.
   forgotten, not a silent failure.
 - Now that A4 exists, **A3 (Fix Engine) is next** — it can finally call
   something real for rollback instead of touching device config with no
-  safety net.
+  safety net. Both A3 and A4 are currently PC-side only by explicit
+  choice — router/device-side fix and rollback (consumer web-UI scraping
+  *and* managed MikroTik/Cisco API access) is flagged above under
+  "Router/device-side fix and rollback," not forgotten, just correctly
+  sequenced behind the Credential Manager.
 - Expand A4 beyond interface admin_enabled once the prerequisites it's
   currently blocked on are addressed: per-interface DNS tracking in A1
   (needed before DNS restore is possible), and a real Windows-verified
