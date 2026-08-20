@@ -282,6 +282,37 @@ actually used — see below). Current version does:
 - `--no-ports` / `--no-wifi` / `--no-internet` / `--no-upnp` /
   `--no-firewall` flags to skip slower or internet/LAN-broadcast-touching
   steps
+- **New in v0.14.0:** `get_interface_network_config()` -- per-interface
+  DNS servers, IP assignment mode, and (when static) the actual static
+  IP/subnet/gateway, keyed by the same interface names
+  `get_interface_status()` already uses. Built for A4's expanded
+  diff-and-rollback work (Ammar's request to cover DNS and static/DHCP
+  mode, not just interface enable/disable): the existing
+  `get_dns_servers()` reads DNS as one flat list across the whole
+  machine, and `get_ip_assignment_mode()` only returns a mode label for
+  one IP -- neither says *which* interface's DNS to restore, or what
+  static values to restore it to. Both existing functions are
+  unchanged and still used exactly as before; this is additive. One
+  Windows pass over `ipconfig /all` captures DNS/DHCP-or-static/IP/
+  mask/gateway together per adapter block, instead of three separate
+  parses. Linux is per-device via `nmcli device show` plus the
+  connection's `ipv4.method`, with the same NetworkManager-only
+  limitation `get_ip_assignment_mode()` already has -- an interface
+  nmcli doesn't manage just doesn't appear, rather than guessing wrong.
+  Also captures `connection_name` (the nmcli connection id on Linux,
+  the networksetup service name on macOS) since A4's write side needs
+  to address the *connection*, not just the device. macOS via
+  `networksetup -getinfo`/`-getdnsservers` -- not yet verified on real
+  macOS hardware, and `-getdnsservers` specifically only shows
+  manually-set DNS overrides, not DHCP-provided ones (a real limitation
+  of that command, not a parsing gap). **Verification, stated
+  honestly:** this sandbox's NetworkManager wouldn't cooperate with a
+  live managed test interface (a container-specific `managed=false`
+  default), so all three platform parsers were verified by feeding
+  them realistic captured command output and checking the parsed
+  result field-by-field, rather than against a live managed interface
+  -- weaker than this codebase's usual real-hardware bar, flagged as
+  such rather than overstated.
 
 **A2 (Rule Engine) is started (v0.7.2).** Standard-library-only Python,
 in its own file (`a2_rule_engine_v0.7.2.py`), deliberately never importing
@@ -486,7 +517,11 @@ A3/AI1/A5 exist to write them. Current version does:
   snapshot's state was read from -- a snapshot now carries its own
   provenance instead of being a freestanding capture with no link back
   to what was actually detected. Existing v0.2.0 rows are unaffected
-  (`source_scan_id` is just `NULL` on them).
+  (`source_scan_id` is just `NULL` on them). Also adds a `finding_id`
+  filter to `get_findings()`, needed by A4's new `fix_firewall_finding()`
+  to look up one specific finding by its stable hash (a `finding_id`
+  can recur across scans, so this combines with the existing
+  newest-first ordering to naturally pick the most recent occurrence).
 - CLI is a bridge, not the final design: `--import-scan` / `--import-
   findings` read A1's/A2's existing `--json` exports, so the whole
   encrypt/store/retrieve path is testable today without changing A1/A2
@@ -518,7 +553,7 @@ that already depended on the JSON files broke. New:
   A2 both stay standard-library-only otherwise, and a scan/evaluation
   still completes normally (with a clear stderr message) if A6 or
   `cryptography` isn't available.
-- Verified end-to-end in this sandbox: `network_discovery_v0.13.1.py
+- Verified end-to-end in this sandbox: `network_discovery_v0.14.0.py
   --cache` wrote a real scan into a fresh A6 database, then
   `a2_rule_engine_v0.7.2.py --cache` (no `--input` given at all) picked
   up that exact scan, evaluated it, and wrote the resulting finding back
@@ -543,117 +578,145 @@ that already depended on the JSON files broke. New:
   prints the message and exits immediately. Re-confirmed `--input`,
   `--cache`, and piped stdin all still work unchanged.
 
-**A4 (Snapshot/Rollback Manager) is started (v0.2.0).** Own file
-(`a4_snapshot_rollback_v0.2.0.py`). Built before A3 on purpose --
+**A4 (Snapshot/Rollback Manager) is started (v0.3.0).** Own file
+(`a4_snapshot_rollback_v0.3.0.py`). Built before A3 on purpose --
 CLAUDE.md already called this order out ("rollback has to exist before
 anything is allowed to touch a device's config"), and A3 doesn't exist
-yet, so this version is built to be fully testable standalone: take a
-snapshot, break something, restore it, verify the restore -- all without
-needing a fix engine to drive it. Current version does:
+yet, so this version is built to be fully testable standalone.
 
-- **Scope, deliberately narrow for v1: this machine's own network
-  settings only, not router config**, and within that, only one thing --
-  an interface's `admin_enabled` state (enabled/disabled). That's the
-  exact finding that's already fired for real on Ammar's hardware (a
-  disabled Ethernet adapter). Two other candidates were considered and
-  deliberately left out rather than guessed at:
-    - **DNS servers** -- A1's `get_dns_servers()` reads DNS as one flat
-      list across the whole machine, not per-interface, so there's no
-      way yet to know which interface a given server belongs to. That's
-      an A1 change first, not something to fake here.
-    - **Wi-Fi radio software on/off** -- A1's own `get_wifi_radio_state()`
-      already explains why it won't touch Windows' real Airplane Mode
-      flag; there's no clean, documented command to *set* the software
-      radio state back either (unlike `admin_enabled`, which
-      `netsh interface set` does support). A confidently-wrong restore
-      is worse than not having the feature -- same reasoning A1 already
-      used for the read side.
-  Router-side snapshot/restore is blocked on the same thing web-UI
-  scraping already is: no point building rollback for something A3
-  can't touch until the Credential Manager exists.
+**v0.3.0 is a real redesign, at Ammar's explicit follow-up request.**
+v0.1.0/v0.2.0 required manually snapshotting one named interface ahead
+of time (`--snapshot INTERFACE`, then `--restore ID`). Ammar didn't
+want that -- he wanted rollback to be automatic: diff the live system
+against A6's already-stored scan history, find whatever actually
+changed, and revert only that, with no manual pre-snapshot step. That
+manual flow is gone, replaced by:
+
+- `diff_against_scan(scan_id=None)` -- reads current live state and
+  compares it field-by-field against a baseline A6 scan (the most
+  recent one, or `--scan-id`). Returns a list of differences, each
+  tagged with whether A4 actually knows how to revert it.
+- `rollback(scan_id=None, dry_run=False)` -- runs the diff, then
+  reverts every revertible difference. Writes a record of what it
+  found and did into A6 (the `snapshots` table, repurposed from "the
+  before-state" to "a log of what a rollback actually did" -- there's
+  no separate before-state to store anymore, the baseline scan already
+  is that).
+
+**Scope expanded well beyond just interface enable/disable, also at
+Ammar's explicit request** ("do all fixes on windows... i want all the
+mentioned things to be done"), after he was walked through the real
+feasibility/risk tradeoffs for each:
+
+- `interface_admin_state` / `interface_mtu` -- unchanged mechanism from
+  v0.1.0, now driven by the diff engine.
+- `interface_dns` -- needed A1 v0.14.0's new per-interface DNS
+  (`get_interface_network_config()`) first; the old flat
+  `get_dns_servers()` couldn't say which interface to fix.
+  `netsh interface ip set/add dns` / `nmcli con mod ipv4.dns` /
+  `networksetup -setdnsservers`.
+- `interface_ip_mode` -- static-vs-DHCP, plus the actual
+  IP/subnet/gateway when reverting to a specific static config -- also
+  needed A1 v0.14.0's richer data, since the old `ip_assignment_mode`
+  was just a label with no values to restore.
+  `netsh interface ip set address dhcp/static` /
+  `nmcli ipv4.method` / `networksetup -setdhcp`/`-setmanual`.
+- `wifi_radio` -- Linux via `rfkill block/unblock wifi`, clean and
+  documented, no concerns. **Windows via the Native WiFi API
+  (`WlanSetInterface`, `wlan_intf_opcode_radio_state`) through
+  `ctypes`** -- there is no netsh/PowerShell command for this; this is
+  the actual API Windows' own network flyout uses internally. Flagged
+  more heavily than anything else in this codebase: it's the only
+  function anywhere in A1/A4 that calls into a DLL instead of a
+  subprocess CLI tool, and it cannot be exercised at all outside a real
+  Windows machine -- not even by feeding it realistic sample text the
+  way the other new parsers/setters were checked, since `ctypes.windll`
+  doesn't exist on Linux. Built against the documented struct layouts,
+  every call wrapped so a failure returns a clean error instead of
+  propagating a raw ctypes exception -- but genuinely unverified in a
+  stronger sense than "not yet tested on real hardware" elsewhere in
+  this codebase. **Ammar asked for this despite the risk being
+  explained** (a wrong read just misinforms; a wrong write actually
+  changes something with no way to verify it did the right thing) --
+  flagged clearly rather than silently built or silently refused.
+
+**What deliberately stayed separate from the generic diff engine:
+firewall rule fixes.** `fix_firewall_rule()` / `fix_firewall_finding()`
+only ever act on the *exact* rule A2's `check_firewall_blocking()`
+already identified as the cause (via a finding's
+`evidence.firewall_rule`, looked up from A6 by `finding_id`) -- never a
+blind diff of "what looks different" in the ruleset, since rules are
+identified by matching (fragile) and a wrong match could disable an
+unrelated rule or remove a real security control. Windows-only for now,
+per Ammar's stated priority: `netsh advfirewall firewall set rule ...
+new enable=no` **disables, never deletes** -- fully reversible, nothing
+lost. A synthetic "profile policy" pseudo-rule (the Windows Firewall
+profile's own default outbound action, not a real named rule -- see
+A1's `_windows_firewall_profile_policy()`) is detected and refused with
+a clear explanation rather than sent to netsh to fail confusingly.
+Linux/macOS need real rule-matching against iptables/nft/pfctl output
+to safely target the same rule, materially harder and riskier
+(iptables especially has no per-rule "disable", only insert/delete by
+exact spec) -- flagged as not built rather than attempted unsafely.
+
 - Reuses A1 and A6 by dynamically loading whichever
   `network_discovery_v*.py` / `a6_encrypted_cache_v*.py` sits next to
-  this file -- same version-decoupling trick A1/A2 already use for A6.
-  Every dynamic-import call is wrapped immediately in `_load_a1()` /
-  `_load_a6_cache()`, which convert any failure into a clear `A4Error`
-  -- applying the exact fix A1 v0.13.1/A2 v0.7.2 needed *from the
-  start*, instead of shipping the same bug a third time.
+  this file, every import wrapped immediately in `_load_a1()` /
+  `_load_a6_cache()` (the A1 v0.13.1/A2 v0.7.2 fix, applied from day
+  one here instead of shipping the same bug a third time).
 - macOS needs its own small `_macos_service_name_for_interface()`
-  lookup: A1's macOS code only keeps the wifi/ethernet *type* per
-  interface, not the actual "Hardware Port" name (e.g. "Wi-Fi",
-  "Thunderbolt Ethernet") that `networksetup -setnetworkserviceenabled`
-  needs as an argument.
-- `take_snapshot()` / `restore_snapshot()` /
-  `verify_reachability_and_maybe_rollback()` as the Python API (for A3
-  to call later). Every restore is **idempotent** (already-correct state
-  -> no-op, reported as such) and **verifies the OS actually applied the
-  change** before reporting success, rather than trusting a command's
-  exit code alone.
+  lookup for admin-state changes specifically: A1's macOS code only
+  keeps the wifi/ethernet *type* per interface, not the actual
+  "Hardware Port" name `networksetup -setnetworkserviceenabled` needs.
+  (The newer DNS/MTU/IP-mode setters get the service name for free from
+  A1 v0.14.0's `connection_name` field instead.)
+- Every restore is **idempotent** and **verifies the OS actually
+  applied the change** before reporting success, rather than trusting a
+  command's exit code alone.
+- CLI: `--diff [--scan-id N]`, `--rollback [--scan-id N] [--dry-run]`,
+  `--verify-and-rollback [--scan-id N]`,
+  `--fix-firewall-finding FINDING_ID`, `--list-events`, plus
+  `--cache-db`/`--cache-key` overrides.
 - **Real bug caught by testing, fixed before it shipped:**
   `verify_reachability_and_maybe_rollback()` originally decided
   "unreachable" from gateway ping loss alone. Testing in this sandbox
   caught a live false positive -- ICMP to the gateway was blocked (100%
   "loss") even though the internet was completely fine (confirmed by
-  `check_internet_reachability()` succeeding at the same time). Deciding
-  on ping loss alone would auto-rollback a working connection just
-  because ICMP happens to be filtered -- the same confident-false-alarm
-  shape A2's `_connectivity_context()` (v0.2.0) already exists to avoid
-  for severity, except here a false positive doesn't just misreport
-  something, it takes a real action. Fixed: `internet_reachable` (A1's
-  TCP-connect check) is now the deciding signal; gateway ping loss is
-  still reported for diagnostics but doesn't trigger a rollback by
-  itself.
-- CLI: `--snapshot INTERFACE [--reason TEXT]`, `--restore ID`,
-  `--verify-and-rollback ID`, `--list-snapshots [--target NAME]`, plus
-  `--cache-db`/`--cache-key` overrides matching A1/A2's existing flag
-  names.
-- Verified in this sandbox on Linux against a real (virtual, throwaway)
-  network interface -- a `veth` pair created specifically so testing
-  never touched this session's actual connectivity: took a snapshot
-  while up, took the interface down manually, restored it via A4,
-  confirmed `admin_enabled` matched the snapshot again. Confirmed the
-  idempotent no-op restore path, and (via a safe mock of A1's
-  reachability check, not by actually breaking real networking) both
-  branches of `verify_reachability_and_maybe_rollback()` -- rolls back
-  when genuinely unreachable, leaves things alone when still reachable.
-  Error paths (unknown interface, unknown snapshot id) tested too.
-  **Windows/macOS command paths follow A1's own established read-side
-  commands exactly but are not yet verified on real hardware** -- same
-  honesty convention A1 already applies to its own unverified platform
-  paths.
-- **Redesigned in v0.2.0, at Ammar's explicit request: `take_snapshot()`
-  no longer queries the OS at all.** v0.1.0 called A1's
-  `get_interface_status()` live, at snapshot time, to read the
-  interface's current state directly off the machine. Ammar wanted
-  snapshots built from the discovery engine's already-collected data
-  instead -- "what A1 already knows," not a fresh, separate OS read
-  taken out of band from any actual scan. v0.2.0 reads the interface's
-  state out of a specific A6 scan (`--scan-id`) or the most recent one
-  by default, and raises a clear error rather than falling back to a
-  live OS read if A6 has no scans yet -- that fallback is exactly the
-  behavior being removed, not a safety net worth keeping.
-  Two real benefits beyond just "don't touch the OS twice": every
-  snapshot now carries provenance via A6 v0.3.0's new
-  `source_scan_id` (which exact scan justified taking it, visible in
-  `--list-snapshots`), and `take_snapshot()` no longer needs A1 at all
-  -- only A6.
-  **What deliberately did not change:** `restore_snapshot()` still
-  reads live OS state twice (idempotency check, then post-restore
-  verification), and `verify_reachability_and_maybe_rollback()` still
-  checks live gateway/internet reachability. Neither can be answered
-  from stored discovery data -- "is this true right now" is exactly
-  what they need to know, and Ammar's request was specifically about
-  where the snapshot's own state comes from, not restore's
-  verification step.
-  Verified end-to-end in this sandbox: ran A1 `--cache` for a real
-  scan, took a snapshot of a real (virtual, throwaway) interface from
-  that exact scan's data, broke the interface manually, restored it,
-  confirmed it matched the snapshot again -- and confirmed
-  `--list-snapshots` shows which scan each snapshot came from. Also
-  confirmed `take_snapshot()` now fails cleanly with no OS query
-  attempted if A6 has no scans yet, and that referencing an interface
-  not present in the given scan, or an unknown scan id, both produce
-  clean errors rather than crashes.
+  `check_internet_reachability()` succeeding at the same time). Fixed:
+  `internet_reachable` (A1's TCP-connect check) is now the deciding
+  signal; gateway ping loss is still reported for diagnostics but
+  doesn't trigger a rollback by itself -- same confident-false-alarm
+  shape A2's `_connectivity_context()` already exists to avoid, except
+  here a false positive would take a real action, not just misreport
+  severity.
+- **Verified in this sandbox, stated precisely about what was and
+  wasn't real:**
+    - `interface_admin_state` and `interface_mtu`: fully real,
+      end-to-end, against a live (virtual, throwaway) veth interface --
+      broke both at once, `--diff` found both without changing
+      anything, `--rollback` reverted both, a second `--rollback` found
+      nothing left, `--dry-run` detected but didn't act, `--list-events`
+      showed an accurate history including the dry run.
+    - `fix_firewall_finding()`: fully real end-to-end against a real
+      iptables DROP rule -- ran A1+A2 for real, looked up a real
+      `check_firewall_blocking()` finding from A6 by its actual
+      `finding_id`, confirmed the lookup/evidence extraction work; the
+      platform guard correctly refused on this Linux sandbox (expected,
+      correct behavior, not a bug).
+    - `interface_dns`, `interface_ip_mode`, and `wifi_radio`'s Linux
+      path (`rfkill`): command construction verified by mocking
+      `subprocess.run` and inspecting the exact command lines built for
+      known inputs -- real writes need NetworkManager cooperation this
+      container's config fights (same limitation A1 v0.14.0 hit), and
+      this container has no real radio device for `rfkill` to act on.
+    - `wifi_radio`'s Windows path: confirmed it fails cleanly rather
+      than crashing on non-Windows, which is the only thing checkable
+      here -- the actual `WlanOpenHandle`/`WlanEnumInterfaces`/
+      `WlanSetInterface` call sequence is unverified in the stronger
+      sense already flagged above.
+    - Windows/macOS `netsh`/`networksetup` command paths (DNS, MTU, IP
+      mode) follow the same documented syntax used elsewhere in this
+      codebase but are not verified on real hardware.
 
 Everything else (A3, A5, A7, the Credential Manager, AI1) is not
 started yet.
@@ -763,24 +826,58 @@ started yet.
   DNS-not-resolving, firewall correlation (including the v0.6.0 "ALL"
   blanket-block branch), and the other rules still need a real scenario
   that actually triggers them before they're considered hardware-checked.
-- **Re-test A4 v0.2.0 against Ammar's real Windows hardware** — verified
-  in this sandbox against a real Linux virtual interface, but the
-  Windows `netsh interface set interface admin=enable/disable` command
-  path (what Ammar will actually use) is not yet confirmed on real
-  hardware. Needs an elevated (Administrator) Command Prompt to work at
-  all — worth confirming that requirement surfaces a clear error if
-  forgotten, not a silent failure.
-- Now that A4 exists, **A3 (Fix Engine) is next** — it can finally call
-  something real for rollback instead of touching device config with no
-  safety net. Both A3 and A4 are currently PC-side only by explicit
-  choice — router/device-side fix and rollback (consumer web-UI scraping
-  *and* managed MikroTik/Cisco API access) is flagged above under
-  "Router/device-side fix and rollback," not forgotten, just correctly
-  sequenced behind the Credential Manager.
-- Expand A4 beyond interface admin_enabled once the prerequisites it's
-  currently blocked on are addressed: per-interface DNS tracking in A1
-  (needed before DNS restore is possible), and a real Windows-verified
-  Wi-Fi-radio set path if one turns out to exist safely.
+- **A4 v0.3.0's full diff-and-rollback engine, and its expanded fix scope
+  (interface admin_enabled/MTU/DNS/static-DHCP mode, Wi-Fi radio, and
+  firewall rule disabling), all still need real-hardware confirmation on
+  Ammar's actual Windows machine** — this is the single biggest
+  outstanding verification gap right now, since v0.3.0 was built and
+  tested entirely in this sandbox:
+    - `admin_enabled` and MTU set/restore: real end-to-end verified here,
+      but only against a throwaway Linux `veth` pair — needs the same
+      test on Ammar's real Windows adapter (elevated/Administrator
+      Command Prompt required, same as v0.2.0's known requirement).
+    - DNS and static/DHCP IP-mode set functions: command construction
+      only verified via mocking on all three platforms — never run
+      against a real interface anywhere, Windows included.
+    - `_set_wifi_radio_windows()` (the ctypes/`wlanapi.dll` software
+      radio toggle): the highest-risk, least-verified piece in the
+      codebase. Only checked that it fails cleanly and doesn't crash
+      when *not* running on Windows — the actual `WlanOpenHandle` →
+      `WlanEnumInterfaces` → `WlanSetInterface` sequence has never run
+      against a real Wi-Fi adapter. Needs deliberate, careful testing on
+      real Windows hardware before it's trusted in front of a
+      non-technical customer — a wrong radio-state write is exactly the
+      kind of thing that erodes the trust CLAUDE.md flags as the biggest
+      risk in this market.
+    - `fix_firewall_rule()` / `fix_firewall_finding()`: the
+      `netsh advfirewall firewall set rule ... enable=no` command itself
+      has never run on a real Windows firewall — only verified end-to-end
+      on this sandbox's Linux `iptables` path (which the function
+      correctly refuses to touch, since it's Windows-only by design), and
+      via mocking for the actual Windows command.
+- Now that A4 has a real fix-and-rollback path (not just rollback), **A3
+  (Fix Engine) is next** — it can wrap A4's `diff_against_scan()` /
+  `rollback()` / `_set_*` / `fix_firewall_rule()` functions with the
+  auto-fix / guided-fix / not-fixable classification, idempotency, and
+  circuit-breaker behavior CLAUDE.md's architecture section calls for,
+  instead of Ammar driving A4's CLI by hand. Both A3 and A4 are still
+  PC-side only by explicit choice — router/device-side fix and rollback
+  (consumer web-UI scraping *and* managed MikroTik/Cisco API access) is
+  flagged above under "Router/device-side fix and rollback," not
+  forgotten, just correctly sequenced behind the Credential Manager.
+- **Extend the firewall fix beyond Windows** — `fix_firewall_rule()` is
+  Windows-only for now (matching A2's `check_firewall_blocking()` finding
+  shape, which already fires on all three platforms). Linux
+  (`iptables`/`nft`) and macOS (`pfctl`) rule-disabling need their own
+  safe, disable-not-delete implementations.
+- **Re-test A1 v0.14.0's `get_interface_network_config()`** (DNS servers,
+  static/DHCP mode, IP/subnet/gateway per interface) against a real
+  managed NetworkManager connection on Linux — this sandbox's
+  NetworkManager wouldn't actually manage the test interface (flagged in
+  A1's own changelog), so the Linux parsing path was only verified
+  against realistic mocked `nmcli` output, not a live connection. Windows
+  (`ipconfig /all`) and macOS (`networksetup`) parsing are in the same
+  boat — real-hardware confirmation still pending for all three.
 - Expand the MAC vendor OUI table (known gap, flagged above)
 - Add mDNS and SNMP to A1's discovery methods (currently ARP/ping/hostname/
   port-probe/Wi-Fi only)
