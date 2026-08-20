@@ -52,7 +52,7 @@ dashboard artifact — keep that panel in sync with this section).
 
 | Module | Name | Role |
 |---|---|---|
-| A1 | Discovery | Finds devices on the network. Current: ARP, ping, hostname, MAC vendor, port probing, Wi-Fi scan. Planned additions: mDNS, SNMP |
+| A1 | Discovery | Finds devices on the network. Current: ARP, ping, hostname, MAC vendor, port probing, Wi-Fi scan, mDNS. Planned additions: SNMP |
 | A2 | Rule Engine | Deterministic known-issue rules. Decides what needs fixing from A1's structured data |
 | AI1 | AI Advisory Layer | **Deferred to post-v1.** Runs locally on-device (never cloud — see constraint above). Does anomaly detection on A1's raw data and correlation on A2's findings, outputs confidence-scored *suggestions only* — never executes fixes itself. Versioned, with rollback, same as rules |
 | A3 | Fix Engine | Executes fixes, classified per-finding as **auto-fix**, **guided-fix**, or **not-fixable**. Idempotent, with a circuit-breaker that stops itself if a fix loops. Draws credentials from the Credential Manager |
@@ -70,19 +70,37 @@ internet, and only opportunistically. Nothing else is allowed to make an
 outbound call — that's not a style preference, it's the core offline-first
 constraint.
 
-**One narrow, deliberate exception, two instances of it:** A1's
-`check_internet_reachability()` does a lightweight TCP-connect reachability
-*test* (not ICMP, no data sent beyond the handshake) to a couple of
-well-known IPs on port 443, and `check_dns_resolution()` sends a raw DNS
-query directly to each configured DNS server to check it actually resolves
-names (catches "internet works but DNS doesn't," which looks identical to
-"internet is down" otherwise). Both are diagnostic checks, not dependencies
-— A1 doesn't need either to succeed for anything else it does, and both are
-skippable together with `--no-internet`. This exists because the product's
-whole vision is diagnosing network issues *including* when the internet
-connection itself is the problem, which needs an actual check of whether
-the WAN path — and DNS specifically — is up. That's a decided carve-out
-rather than an unnoticed rule break. No other module gets this exception.
+**One narrow, deliberate exception, now seven instances of it (expanded
+from two in A1 v0.15.0):** A1's `check_internet_reachability()` does a
+lightweight TCP-connect reachability *test* (not ICMP, no data sent beyond
+the handshake) to a couple of well-known IPs on port 443, and
+`check_dns_resolution()` sends a raw DNS query directly to each configured
+DNS server to check it actually resolves names (catches "internet works
+but DNS doesn't," which looks identical to "internet is down" otherwise).
+v0.15.0 added five more diagnostic tests of the same kind, each answering
+a question that genuinely can't be answered without one outbound probe:
+`traceroute_to_internet()` (hop-by-hop path to a known target, LAN-only
+`traceroute_to_gateway()` is a separate, non-exception function), 
+`check_pmtu_blackhole()` (a DF-set ping-size ladder against a known
+target, to catch a silently-dropped-oversized-packet path — logic-
+reviewed only so far, no real blackholed path exists to test against),
+`check_captive_portal()` (a plain HTTP GET to a well-known
+captive-portal-detection endpoint, since "internet looks connected but
+nothing works" needs distinguishing from a real outage), `measure_throughput()`
+(a real download-speed measurement against a public test endpoint), and
+`check_nat_type()` (a hand-built STUN request for public-address discovery
+and a coarse cone-vs-symmetric NAT guess). All seven are diagnostic
+checks, not dependencies — A1 doesn't need any of them to succeed for
+anything else it does. Unlike the original two, which share `--no-internet`,
+**each of the five new ones gets its own individual `--no-X` flag**
+(`--no-traceroute`, `--no-pmtu`, `--no-captive-portal`, `--no-throughput`,
+`--no-nat-type`) — Ammar's explicit choice, for finer per-check control
+than one blanket flag would give. This exists because the product's whole
+vision is diagnosing network issues *including* when the internet
+connection itself is the problem, which needs actual checks of whether the
+WAN path, DNS, and now the deeper quality/interception picture are up.
+That's a decided, repeatedly-revisited carve-out rather than an unnoticed
+rule break. No other module gets this exception.
 
 **Credential Manager** lives locally inside the Core Engine (not the cloud) —
 device/router login credentials, encrypted at rest, never leave the device.
@@ -313,9 +331,112 @@ actually used — see below). Current version does:
   result field-by-field, rather than against a live managed interface
   -- weaker than this codebase's usual real-hardware bar, flagged as
   such rather than overstated.
+- **New in v0.15.0: a large batch of ~21 new discovery functions**, prompted
+  by Ammar asking what other network details would help diagnose precisely,
+  and then asking for all of them built. Grouped by category:
+    - **Layer 2/topology:** `get_interface_link_info()` (speed/duplex per
+      interface — Windows duplex deliberately declined, no reliable
+      non-PowerShell source, same call as the Airplane Mode decision below),
+      `get_dhcp_lease_info()` (which server issued the lease, and its
+      obtained/expires timestamps on Windows/macOS or just a lease
+      *duration* on Linux — `nmcli` genuinely doesn't expose absolute
+      timestamps, not a parsing shortfall), `detect_rogue_dhcp_servers()`
+      (broadcasts a hand-built DHCPDISCOVER and counts distinct DHCPOFFER
+      responders — needs root/admin to bind UDP port 68, flagged the same
+      way `check_firewall_rules()` flags its own root requirement),
+      `detect_duplicate_ip()` (best-effort only — compares two ARP-table
+      reads taken a few seconds apart, catches a MAC change in that window,
+      nothing more, stated as such rather than as a guarantee), the ARP
+      table itself now surfaced in the output (it was already being
+      computed internally, just never returned), `discover_upnp_devices()`
+      (generalizes the existing gateway-only SSDP discovery to every LAN
+      device that answers), and `discover_mdns_devices()` (new — resolves
+      the "add mDNS" item that had been on the horizon; needed a real
+      DNS-wire-format answer-record walker, not just the header parse the
+      existing raw-DNS-query code already had).
+    - **Routing:** `get_routing_table()`, `traceroute_to_gateway()`
+      (LAN-only, not an exception) and `traceroute_to_internet()` (one of
+      the five new exceptions, see the Architecture section above) — both
+      shell out to the OS `tracert`/`traceroute` binary and regex hop
+      lines, same no-raw-socket house style as `check_gateway_latency()`.
+    - **DNS (deeper):** `read_hosts_file()` (runs on *every* scan,
+      unconditionally — A4's new hosts-file fix needs a baseline),
+      `dump_dns_cache()` (a real tool on Windows, aggregate stats only on
+      Linux, an honestly-stated gap on macOS — no clean non-root option
+      exists there), `get_dns_suffix_search_list()`. Per-DNS-server
+      latency needed no new function — `check_dns_resolution()` already
+      returns it.
+    - **Proxy/VPN/interception:** `get_system_proxy_config()` (runs every
+      scan, unconditionally, for the same A4-baseline reason as the hosts
+      file — Windows uses the stdlib `winreg` module directly rather than
+      shelling out to `reg query`, a deliberate one-off departure from this
+      file's usual style since `winreg` exists exactly for this),
+      `detect_vpn_adapters()` (a classification pass over data
+      `get_interface_status()` already returns, not a new OS query), and
+      two of the five new exceptions: `check_pmtu_blackhole()` and
+      `check_captive_portal()` (see the Architecture section above for
+      both).
+    - **Wi-Fi (deeper):** `get_wifi_connection_details()` (link
+      rate/signal/noise/802.11 standard for the *currently associated*
+      network only — deliberately separate from `scan_wifi_networks()`,
+      which describes nearby SSIDs with no live link-quality data
+      available for them), WPS-enabled detection folded into
+      `scan_wifi_networks()`'s existing per-SSID dicts but **Linux-only**
+      (Windows/macOS scan tools don't expose it cleanly, stated as a gap
+      rather than guessed at), and `get_wifi_power_management()`
+      (**Linux-only** by explicit decision — Windows has no clean
+      non-PowerShell source, same reasoning as the declined Windows
+      Airplane Mode read below; macOS ties this to system-wide Energy
+      Saver with no discrete per-adapter toggle. Runs unconditionally on
+      Linux every scan, for A4's new Linux-only fix).
+    - **IPv6:** `get_ipv6_status()` — per-interface addresses, default
+      gateway, DNS servers, plus a pure-logic dual-stack/IPv4-only/IPv6-only
+      classification.
+    - **Time:** `check_clock_drift()` — deliberately reads the OS's own
+      already-computed sync status rather than independently querying a
+      live NTP server, since that would have been an unapproved *sixth*
+      internet exception beyond the five actually approved.
+    - **Quality:** jitter added directly to the existing
+      `check_gateway_latency()` return (mean absolute difference between
+      consecutive RTT samples, zero new subprocess calls), plus the last
+      two of the five new exceptions: `measure_throughput()` (a real 2MB
+      download against a public Cloudflare speed-test endpoint) and
+      `check_nat_type()` (a hand-built RFC 5389 STUN request against
+      Google's public STUN server, parsing the XOR-MAPPED-ADDRESS to learn
+      this machine's own public IP:port — full RFC 3489 NAT-type
+      classification wasn't attempted, a second-server comparison gives
+      only a coarse cone-vs-symmetric guess, stated as such).
+    - **Host-level:** `get_driver_info()` (Windows via the now-deprecated
+      `wmic`, flagged as such; Linux via `ethtool -i`, the cleanest of the
+      three; macOS best-effort via `system_profiler`).
+  Seven new `--no-X` CLI flags total (`--no-dhcp-probe`, `--no-mdns`,
+  `--no-traceroute`, `--no-pmtu`, `--no-captive-portal`, `--no-throughput`,
+  `--no-nat-type`); `read_hosts_file()`, `get_system_proxy_config()`, and
+  (on Linux) `get_wifi_power_management()` are **not** gated by any flag,
+  since A4 needs them captured every scan regardless.
+  **Real bug caught and fixed during testing:** `discover_mdns_devices()`
+  initially reported this machine's own outgoing multicast query as if it
+  were a responding device — IP multicast loopback delivering the query
+  back into the same socket. Fixed with `IP_MULTICAST_LOOP=0`, reverified
+  it correctly reports zero devices when nothing actually responds.
+  **Verified, stated honestly:** the full `run_discovery()` pipeline ran
+  end-to-end in this sandbox with all new fields included; real
+  `/sys`/`ethtool` link-info reads, real routing table/traceroute/hosts-file/
+  resolv.conf/proxy-env-var/IPv6 reads, a real (root) DHCP broadcast probe,
+  real mDNS/SSDP socket round-trips, a real 2MB throughput download, and a
+  real captive-portal check (which also confirmed this sandbox's outbound
+  proxy doesn't intercept plain HTTP, so the true-negative path is
+  trustworthy here) all ran for real. STUN/NAT-type packet construction and
+  parsing were verified by hand-building and round-tripping the packets
+  locally, but the live UDP round-trip to Google's public STUN server
+  timed out in this sandbox — outbound UDP isn't cooperative here. Every
+  Windows/macOS-specific path (and the Linux paths needing a live
+  NetworkManager connection) is command-construction-verified only, same
+  standard as every previous round — no real Windows/macOS machine
+  available in this environment.
 
-**A2 (Rule Engine) is started (v0.8.0).** Standard-library-only Python,
-in its own file (`a2_rule_engine_v0.8.0.py`), deliberately never importing
+**A2 (Rule Engine) is started (v0.9.0).** Standard-library-only Python,
+in its own file (`a2_rule_engine_v0.9.0.py`), deliberately never importing
 A1's file directly -- it reads the same dict A1's `--json` export produces
 (file-based handoff: A1 writes `--json scan.json`, A2 reads `--input
 scan.json`), so A1 can keep bumping its own version/filename with zero
@@ -333,7 +454,7 @@ changes needed in A2. Current version does:
 - `evaluate()`: runs every registered rule against A1's discovery dict,
   wrapping each one individually so one rule raising an exception doesn't
   take down the rest (same defensive pattern as A1's own scan steps)
-- Rule set (13 rules): Wi-Fi radio off (hardware/software), adapter
+- Rule set (27 rules): Wi-Fi radio off (hardware/software), adapter
   disabled, adapter enabled-but-not-connected, no gateway found, gateway
   unreachable/high packet loss/high latency, internet unreachable (with a
   WAN-vs-LAN distinction based on whether the gateway itself is reachable),
@@ -343,7 +464,8 @@ changes needed in A2. Current version does:
   port open, Wi-Fi channel congestion recommendation, DNS not configured,
   a specific interface set to static with no DNS configured (v0.8.0, see
   below), DNS configured but not resolving (v0.3.0, see below), a local
-  firewall rule blocking DNS/ICMP (v0.4.0, see below)
+  firewall rule blocking DNS/ICMP (v0.4.0, see below), plus 14 more rules
+  added in v0.9.0 (see below)
 - CLI: prints findings sorted by severity with a summary count, `--json`
   export in the same shape A6 will eventually store directly
 - `--cache` (v0.7.0): skips `--input` entirely, reads the most recent scan
@@ -486,6 +608,58 @@ changes needed in A2. Current version does:
   surfaced the v0.2.0 fix) -- next up: run the current version against
   real hardware again to confirm the v0.2.0 through v0.6.0 changes, then
   expand the rule set further
+- **New in v0.9.0: 14 more rules**, matching A1 v0.15.0's big discovery
+  expansion one-for-one against the same "does this new field have a safe,
+  non-guessing trigger condition" test v0.8.0 already established (the
+  MTU-rule rejection is the precedent): `check_rogue_dhcp`,
+  `check_duplicate_ip`, `check_multiple_default_routes`,
+  `check_hosts_file_hijack` (deliberately narrow -- only fires if one of
+  A1's *own* known-good hostnames, like its DNS test host or the
+  captive-portal/throughput endpoints, is redirected to a real non-loopback
+  address in the hosts file; declines the broader "any suspicious entry"
+  idea since there's no safe way to tell a legitimate ad-block hosts file
+  apart from real hijacking without an internet-connected reputation
+  service), `check_proxy_configured` and `check_vpn_active` (both scaled
+  by `_connectivity_context()`, same pattern as the original v0.2.0 fix),
+  `check_pmtu_blackhole_finding` (routes to A4's *existing*
+  `_set_interface_mtu()` fix -- no new A4 category needed), 
+  `check_captive_portal_finding`, `check_wifi_weak_signal` (an SNR
+  threshold, not raw RSSI), `check_wifi_power_saving_enabled`
+  (deliberately correlated against an actual gateway-latency/jitter
+  symptom before firing -- power-save being on by itself is normal, not a
+  problem), `check_wps_enabled` (the router's own setting, no credentials
+  to change it -- same territory as the flagged web-UI-scraping decision),
+  `check_clock_not_synced`, `check_high_jitter`, and
+  `check_throughput_critically_low`. Several new A1 fields were
+  deliberately left evidence-only with no new rule -- link speed/duplex,
+  DHCP lease time, ARP/UPnP/mDNS device inventories, both traceroutes, DNS
+  cache/suffix-list contents, 802.11 standard by itself, IPv6/dual-stack
+  status, NAT type, and driver version -- same "no safe non-guessing
+  threshold" discipline as the MTU decision.
+- **`check_clock_not_synced` and the upgraded `check_dns_not_resolving`
+  (see next bullet) are the first two uses of `FIX_AUTO` anywhere in this
+  codebase.** Every rule before v0.9.0 used `FIX_GUIDED` or `FIX_NONE` --
+  `FIX_AUTO` existed in the schema from day one but had never actually been
+  assigned. Both are judged safe/reversible with no real user tradeoff
+  (an NTP resync, a DNS cache flush), unlike every `FIX_GUIDED` rule, which
+  touches interface/firewall/Wi-Fi config with a real tradeoff attached.
+  A3 (Fix Engine) doesn't exist yet, so today this only labels data --
+  nothing auto-executes until A3 is built to read `fix_classification` and
+  act on it.
+- **`check_dns_not_resolving()` upgraded from `FIX_GUIDED` to `FIX_AUTO`**
+  (v0.9.0) -- a deliberate change to existing behavior, not a new rule,
+  now that A4 v0.4.0 has a real, safe `flush_dns_cache()` one-shot action
+  to back it. Trigger logic unchanged.
+- **Regression-tested against a real A1 v0.15.0 scan from this sandbox:**
+  all 13 pre-existing rules produced byte-identical findings. Of the 14
+  new rules, `check_proxy_configured` genuinely fired against real data
+  (this sandbox's own outbound agent-proxy env var, correctly detected via
+  the Linux code path, severity `info` since the internet was reachable at
+  the time) -- the other 13 correctly did not fire, verified against this
+  sandbox's actual field values (single default route, no rogue DHCP/
+  duplicate IPs/VPN interfaces, no captive portal, `clock_drift.synchronized`
+  was `None` not `False` so it correctly didn't fire, etc.). Synthetic
+  fixtures cover every new rule's firing and non-firing paths.
 
 **A6 (Encrypted local cache) is started (v0.3.0).** Own file
 (`a6_encrypted_cache_v0.3.0.py`). Handles what actually exists so far --
@@ -561,6 +735,13 @@ A3/AI1/A5 exist to write them. Current version does:
   reads it back, confirms the canary never appears in the raw `.db`
   bytes) so this module's own correctness doesn't depend on having A1/A2
   output on hand.
+- **Needed no changes for A1 v0.15.0 / A2 v0.9.0 / A4 v0.4.0's big diagnostic-
+  detail batch.** Every new A1 field, new A2 finding category, and new A4
+  `snapshot_type` (`"one_shot_action"`, see A4's entry below) fits the
+  existing schema-free design: `scans.payload`/`findings.payload`/
+  `snapshots.payload` are arbitrary encrypted JSON blobs, and `category`/
+  `snapshot_type` are plain free-text columns, not enums -- confirmed
+  explicitly rather than assumed, so A6 stays at v0.3.0 through this round.
 
 **A1 and A2 are now wired directly into A6 (v0.13.0 / v0.7.0).** The old
 JSON file handoff (`--json scan.json` / `--input scan.json`) still works
@@ -609,8 +790,8 @@ that already depended on the JSON files broke. New:
   prints the message and exits immediately. Re-confirmed `--input`,
   `--cache`, and piped stdin all still work unchanged.
 
-**A4 (Snapshot/Rollback Manager) is started (v0.3.0).** Own file
-(`a4_snapshot_rollback_v0.3.0.py`). Built before A3 on purpose --
+**A4 (Snapshot/Rollback Manager) is started (v0.4.0).** Own file
+(`a4_snapshot_rollback_v0.4.0.py`). Built before A3 on purpose --
 CLAUDE.md already called this order out ("rollback has to exist before
 anything is allowed to touch a device's config"), and A3 doesn't exist
 yet, so this version is built to be fully testable standalone.
@@ -762,11 +943,89 @@ exact spec) -- flagged as not built rather than attempted unsafely.
       mode) follow the same documented syntax used elsewhere in this
       codebase but are not verified on real hardware.
 
+**v0.4.0 adds 3 more `diff_against_scan()`/`rollback()` categories and 2
+new one-shot corrective actions**, matching A1 v0.15.0's new discovery
+fields that turned out to be genuinely fixable (most of the new fields
+aren't -- see A2's v0.9.0 evidence-only list above, the same discipline
+applied here):
+
+- `hosts_file_entries` -- flags active hosts-file entries present live
+  but not in the baseline scan (A1's `read_hosts_file()` now runs every
+  scan specifically for this). `_set_hosts_file_entries()` removes them
+  by exact line match, a plain file edit, not a subprocess call --
+  **one-directional on purpose**: it only removes entries added since the
+  baseline, it never restores entries that were removed. Verified for
+  real against a throwaway `/tmp` test file (confirmed every other line
+  survives byte-identical); the real system hosts file was never touched
+  in testing (confirmed via `md5sum` before/after).
+- `system_proxy_config` -- Windows (`winreg` write, no `InternetSetOption`
+  refresh broadcast -- flagged as a future addition, same caution class as
+  `_set_wifi_radio_windows()` below) and macOS (`networksetup
+  -setwebproxystate`/`-setsecurewebproxystate off`, disable-only) diffs
+  are revertible. **Linux diffs are always marked non-revertible, with an
+  explanatory note** -- `http_proxy`/`https_proxy` are environment
+  variables of an already-running process, and nothing can change another
+  process's environment from outside it after the fact; marking this
+  revertible would misreport what a rollback actually did. Best-effort
+  GNOME-only `gsettings` is attempted anyway where it's plausibly useful,
+  but the diff's own `revertible` flag stays honest about the real
+  limitation.
+- `wifi_power_management` -- **Linux-only**, matching A1's Linux-only
+  read side. `_set_wifi_power_management()` reuses A1's own Wi-Fi-
+  interface-name lookup so the read and write sides can't disagree about
+  which interface is "the" Wi-Fi one.
+- `flush_dns_cache()` / `sync_system_clock()` -- two new one-shot
+  corrective actions (not diff/rollback -- same shape as
+  `fix_firewall_rule()`: an engine function plus a thin CLI wrapper), new
+  CLI flags `--flush-dns-cache` / `--sync-clock`. **Both now write an A6
+  audit row on every call, success or failure** (`snapshot_type=
+  "one_shot_action"`) -- a new decision this round, and a deliberate
+  improvement over `fix_firewall_rule()`'s current silence (not
+  retrofitted onto the firewall fix this round, just noted as an
+  inconsistency). These are what back A2 v0.9.0's two new `FIX_AUTO`
+  classifications (`check_dns_not_resolving`, `check_clock_not_synced`).
+- **Verified in this sandbox:** `_set_hosts_file_entries()` for real
+  (throwaway file, see above); `flush_dns_cache()` for real (a real
+  failure here, since this container has neither `systemd-resolve` nor
+  `resolvectl` -- the failure path and its A6 audit row both confirmed
+  working); `sync_system_clock()` for real (a real failure here too --
+  `timedatectl` can't reach D-Bus since this container doesn't run
+  systemd as PID 1 -- same "verified the real failure path, not the
+  success path" honesty as the DNS flush); `_set_wifi_power_management()`
+  fails cleanly for real (no `iw` in this container); a full real
+  A1→A6→A4 CLI run (`--diff`, `--flush-dns-cache`, `--sync-clock` against
+  a live scan) completed with zero crashes and zero false positives.
+  `_set_system_proxy_config()` on all three platforms, and
+  `_set_wifi_power_management()`'s actual `iw` command line, are
+  command-construction-verified only (mocked `subprocess.run`) -- no
+  Windows/macOS machine and no real wireless interface available here.
+  `eth0` and the real `/etc/hosts` confirmed byte-identical before and
+  after all testing.
+
 Everything else (A3, A5, A7, the Credential Manager, AI1) is not
 started yet.
 
 ## Flagged / open decisions
 
+- **Gateway-MAC-stability-across-scans (ARP-spoofing-style detection) —
+  flagged, not built.** A2's `evaluate(data)` only ever sees one scan's
+  discovery dict; `RULES` are all single-scan functions with no
+  `previous_scan` parameter anywhere in the contract. Checked this
+  carefully during A2 v0.9.0's batch of new rules: `check_rogue_dhcp()`
+  turned out not to need it (a single-scan active broadcast probe, not a
+  comparison), and `check_hosts_file_hijack()` turned out not to need it
+  either (a single-scan, self-referential check against A1's own
+  known-good hostnames) — but "did the gateway's MAC address change since
+  the last scan" genuinely can't be answered without comparing against a
+  previous scan, and there's no minimal way to bolt that onto the
+  existing single-scan rule contract without either special-casing one
+  rule or widening `evaluate()`'s signature for everyone. The minimal
+  future shape, if this gets built: `evaluate(data, previous_scan=None)`,
+  used only by the 2-3 rules that actually need history, not a blanket
+  contract change for the other 25+ rules that don't. Matches AI1's
+  already-stated deferred cross-scan-correlation roadmap — this is
+  arguably AI1's job once it exists, not a reason to build a parallel
+  mechanism in A2 first.
 - **CDP and LLDP discovery — flagged, not built.** Both need raw Layer-2
   packet capture (passively listening for frames switches broadcast),
   which needs root/admin on every desktop OS, and has **no viable path at
@@ -922,9 +1181,39 @@ started yet.
   against realistic mocked `nmcli` output, not a live connection. Windows
   (`ipconfig /all`) and macOS (`networksetup`) parsing are in the same
   boat — real-hardware confirmation still pending for all three.
+- **A1 v0.15.0 / A2 v0.9.0 / A4 v0.4.0's entire ~21-function diagnostic-
+  detail batch needs real-hardware confirmation** — built and tested
+  entirely in this sandbox, same biggest-outstanding-gap shape as every
+  previous round, but larger:
+    - Most Windows-specific reads (link speed/duplex, DHCP lease via
+      `ipconfig`, DNS suffix list, proxy via `winreg`, driver info via
+      `wmic`, Wi-Fi connection details via `netsh`) and all macOS-specific
+      reads are command-construction-verified only.
+    - `detect_rogue_dhcp_servers()`'s true-positive path (a second real
+      DHCP server actually responding) has never been exercised — this
+      sandbox has no second DHCP server to test against.
+    - `check_pmtu_blackhole()`, `check_captive_portal()`'s true-positive
+      path, `measure_throughput()` against a genuinely degraded link, and
+      `check_nat_type()`'s full classification accuracy are all
+      logic-reviewed only — none of these has a real trigger condition
+      available in this sandbox (no real blackholed path, no real captive
+      portal, no real slow link, and this sandbox's own NAT setup isn't
+      necessarily representative of a customer's router).
+    - The live STUN UDP round-trip specifically timed out in this
+      sandbox (outbound UDP isn't cooperative here) — packet
+      construction/parsing were verified by hand, but a real round-trip
+      against a real STUN server has never succeeded here.
+    - A4's `_set_system_proxy_config()` (all 3 platforms) and
+      `_set_wifi_power_management()`'s real `iw` command are
+      command-construction-verified only — no real Windows/macOS machine
+      and no real wireless interface in this sandbox.
+    - `flush_dns_cache()` and `sync_system_clock()` were only exercised
+      via their *failure* paths here (this container has neither
+      `systemd-resolve`/`resolvectl` nor a working `timedatectl`) — the
+      success path on a real system with those tools present is
+      unverified.
 - Expand the MAC vendor OUI table (known gap, flagged above)
-- Add mDNS and SNMP to A1's discovery methods (currently ARP/ping/hostname/
-  port-probe/Wi-Fi only)
+- Add SNMP to A1's discovery methods (mDNS shipped in v0.15.0)
 - Expand A2's rule set further, once the real-hardware retest confirms the
   current rules
 - AI layer (AI1) stays deferred until after a working core (A1-A7 minus AI1)
