@@ -3,8 +3,52 @@
 a4_snapshot_rollback.py -- Module A4 (Snapshot / Rollback Manager) of the
 offline network diagnostic app.
 
-VERSION: 0.1.0
+VERSION: 0.2.0
 CHANGELOG:
+  0.2.0 - Ammar's explicit request: take_snapshot() should build a
+          snapshot from A1's already-collected discovery data sitting
+          in A6, not from a fresh, separate OS query at snapshot time.
+          Rewrote it: reads the interface's state out of a specific A6
+          scan (--scan-id) or the most recent one by default, instead
+          of calling get_interface_status() live. If A6 has no scans
+          yet, this now raises a clear A4Error telling you to run A1
+          --cache first -- it does not fall back to a live OS read,
+          since that fallback is exactly the behavior being removed.
+
+          Two real benefits beyond just "don't touch the OS twice":
+          every snapshot now carries provenance (which exact scan
+          justified taking it, via A6 v0.3.0's new source_scan_id
+          column) instead of being a freestanding capture with no link
+          back to what was actually detected; and take_snapshot() no
+          longer needs A1 at all -- only A6 -- which is a real
+          simplification, not just a style change.
+
+          What deliberately did NOT change: restore_snapshot() still
+          reads live OS state, twice -- once to check idempotency
+          (is the interface already in the target state), once after
+          running the set-state command to verify it actually took
+          effect. verify_reachability_and_maybe_rollback() still checks
+          live gateway/internet reachability. Neither of those can be
+          answered from stored discovery data; "is this real, right
+          now" is exactly what they need to know, and only a live read
+          can say that. Ammar's request was specifically about where
+          the snapshot's own state comes from, not about restore's
+          verification step.
+
+          A6 gets a matching v0.3.0: get_scan(id) (a direct lookup,
+          same shape as v0.2.0's get_snapshot(id) -- closes a gap
+          flagged twice before but never fixed since nothing needed it
+          until now) and the new source_scan_id column.
+
+          Verified end-to-end in this sandbox: ran A1 --cache for a
+          real scan, took a snapshot of a real (virtual, throwaway)
+          interface from that exact scan's data with --scan-id, broke
+          the interface manually, restored it, confirmed it matched
+          the snapshot again -- and confirmed --list-snapshots shows
+          which scan each snapshot came from. Also confirmed
+          take_snapshot() now fails cleanly (no OS query attempted) if
+          A6 has no scans yet.
+
   0.1.0 - First version. CLAUDE.md places A4 before A3 (Fix Engine) on
           purpose: "rollback has to exist before anything is allowed to
           touch a device's config", and auto-rollback-if-unreachable is
@@ -261,26 +305,51 @@ def _set_interface_admin_state(name, enabled):
         return False, f"Command failed: {e}"
 
 
-def take_snapshot(interface_name, reason=None, cache_db=None, cache_key=None):
+def take_snapshot(interface_name, reason=None, scan_id=None, cache_db=None, cache_key=None):
     """
-    Reads the named interface's current state via A1 and stores it in
-    A6 as a snapshot. Returns (snapshot_id, errors) -- errors is
-    whatever get_interface_status() reported, even on success (same
-    pattern A1/A2 use throughout: report partial trouble, don't hide it).
-    """
-    a1 = _load_a1()
-    interfaces, errors = a1.get_interface_status()
-    match = next((i for i in interfaces if i["name"] == interface_name), None)
-    if match is None:
-        names = ", ".join(i["name"] for i in interfaces) or "(none found)"
-        raise A4Error(f"No interface named {interface_name!r} found. Available: {names}")
+    Builds a snapshot from A1's already-collected discovery data sitting
+    in A6 -- a specific scan_id, or the most recent scan if not given --
+    rather than querying the OS directly. Ammar's explicit request: the
+    snapshot is "what the discovery engine already knows" about the
+    interface, not a fresh, separate OS read taken out of band from any
+    actual scan. This also means the resulting snapshot carries real
+    provenance (source_scan_id) -- which scan justified taking it -- and
+    that take_snapshot() no longer needs A1 at all, only A6.
 
+    If A6 has no scans yet, this raises rather than silently falling
+    back to a live OS read -- that fallback is exactly the behavior
+    being removed, not a safety net to keep around.
+
+    Returns (snapshot_id, scan_id_used).
+    """
     with _load_a6_cache(cache_db, cache_key) as cache:
+        if scan_id is not None:
+            scan = cache.get_scan(scan_id)
+            if scan is None:
+                raise A4Error(f"No scan with id {scan_id} in A6.")
+        else:
+            scans = cache.get_scans(limit=1)
+            if not scans:
+                raise A4Error(
+                    "A6 has no scans yet -- run A1 with --cache first, "
+                    "then take a snapshot from that scan's data."
+                )
+            scan = scans[0]
+
+        interfaces = scan["discovery"].get("interfaces", [])
+        match = next((i for i in interfaces if i["name"] == interface_name), None)
+        if match is None:
+            names = ", ".join(i["name"] for i in interfaces) or "(none found)"
+            raise A4Error(
+                f"No interface named {interface_name!r} in scan {scan['id']} "
+                f"(scanned_at={scan['scanned_at']}). Available: {names}"
+            )
+
         snapshot_id = cache.write_snapshot(
             target=interface_name, snapshot_type="interface_admin_state",
-            state=match, reason=reason,
+            state=match, reason=reason, source_scan_id=scan["id"],
         )
-    return snapshot_id, errors
+    return snapshot_id, scan["id"]
 
 
 def restore_snapshot(snapshot_id, cache_db=None, cache_key=None):
@@ -393,8 +462,12 @@ def main():
                      "captures and restores this machine's own interface state"
     )
     parser.add_argument("--snapshot", metavar="INTERFACE",
-                         help="Snapshot the named interface's current admin_enabled state")
+                         help="Snapshot the named interface's state from A6's discovery data "
+                              "(the most recent scan, or --scan-id)")
     parser.add_argument("--reason", default=None, help="Plain-language reason to store with --snapshot")
+    parser.add_argument("--scan-id", type=int, default=None,
+                         help="With --snapshot, read the interface's state from this specific A6 scan "
+                              "instead of the most recent one")
     parser.add_argument("--restore", metavar="ID", type=int, help="Restore a snapshot by id")
     parser.add_argument("--verify-and-rollback", metavar="ID", type=int,
                          help="Check gateway/internet reachability; restore this snapshot automatically if unreachable")
@@ -408,12 +481,12 @@ def main():
     try:
         if args.snapshot:
             did_something = True
-            snapshot_id, errors = take_snapshot(
-                args.snapshot, reason=args.reason, cache_db=args.cache_db, cache_key=args.cache_key,
+            snapshot_id, used_scan_id = take_snapshot(
+                args.snapshot, reason=args.reason, scan_id=args.scan_id,
+                cache_db=args.cache_db, cache_key=args.cache_key,
             )
-            for e in errors:
-                print(f"  ! {e}", file=sys.stderr)
-            print(f"Snapshot {snapshot_id} taken for interface {args.snapshot!r}"
+            print(f"Snapshot {snapshot_id} taken for interface {args.snapshot!r} "
+                  f"from scan id {used_scan_id}"
                   + (f" ({args.reason})" if args.reason else ""))
 
         if args.restore is not None:
@@ -438,8 +511,9 @@ def main():
                 print("No snapshots match.")
             for s in snaps:
                 restored = f"restored {s['restored_at']}" if s["restored_at"] else "not restored"
+                source = f"scan={s['source_scan_id']}" if s["source_scan_id"] is not None else "scan=-"
                 print(f"[{s['id']}] {s['created_at']}  {s['snapshot_type']:<24} "
-                      f"target={s['target']:<12} {restored}  state={s['state']}")
+                      f"target={s['target']:<12} {source:<9} {restored}  state={s['state']}")
     except A4Error as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

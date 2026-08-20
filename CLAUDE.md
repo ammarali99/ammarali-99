@@ -425,8 +425,8 @@ changes needed in A2. Current version does:
   real hardware again to confirm the v0.2.0 through v0.6.0 changes, then
   expand the rule set further
 
-**A6 (Encrypted local cache) is started (v0.2.0).** Own file
-(`a6_encrypted_cache_v0.2.0.py`). Handles what actually exists so far --
+**A6 (Encrypted local cache) is started (v0.3.0).** Own file
+(`a6_encrypted_cache_v0.3.0.py`). Handles what actually exists so far --
 A1 scans, A2 findings, and (new in v0.2.0) A4 snapshots -- rather than
 pre-building tables for fix_outcomes/AI suggestions/reports before
 A3/AI1/A5 exist to write them. Current version does:
@@ -477,6 +477,16 @@ A3/AI1/A5 exist to write them. Current version does:
   the actual captured state and the human-readable `reason` a snapshot
   was taken go into one encrypted BLOB. `--selftest` now also covers the
   snapshots table with its own canary check.
+- **New in v0.3.0, driven by A4's redesign:** `get_scan(id)` -- a direct
+  lookup for the scans table, same shape as v0.2.0's `get_snapshot(id)`.
+  Closes a gap flagged twice before (A2 v0.7.0's changelog, A4 v0.1.0's
+  own code) but never fixed since nothing needed it until A4's new
+  `take_snapshot()` became its first real caller. Also adds
+  `snapshots.source_scan_id` (nullable) recording which A1 scan a
+  snapshot's state was read from -- a snapshot now carries its own
+  provenance instead of being a freestanding capture with no link back
+  to what was actually detected. Existing v0.2.0 rows are unaffected
+  (`source_scan_id` is just `NULL` on them).
 - CLI is a bridge, not the final design: `--import-scan` / `--import-
   findings` read A1's/A2's existing `--json` exports, so the whole
   encrypt/store/retrieve path is testable today without changing A1/A2
@@ -533,8 +543,8 @@ that already depended on the JSON files broke. New:
   prints the message and exits immediately. Re-confirmed `--input`,
   `--cache`, and piped stdin all still work unchanged.
 
-**A4 (Snapshot/Rollback Manager) is started (v0.1.0).** Own file
-(`a4_snapshot_rollback_v0.1.0.py`). Built before A3 on purpose --
+**A4 (Snapshot/Rollback Manager) is started (v0.2.0).** Own file
+(`a4_snapshot_rollback_v0.2.0.py`). Built before A3 on purpose --
 CLAUDE.md already called this order out ("rollback has to exist before
 anything is allowed to touch a device's config"), and A3 doesn't exist
 yet, so this version is built to be fully testable standalone: take a
@@ -611,6 +621,39 @@ needing a fix engine to drive it. Current version does:
   commands exactly but are not yet verified on real hardware** -- same
   honesty convention A1 already applies to its own unverified platform
   paths.
+- **Redesigned in v0.2.0, at Ammar's explicit request: `take_snapshot()`
+  no longer queries the OS at all.** v0.1.0 called A1's
+  `get_interface_status()` live, at snapshot time, to read the
+  interface's current state directly off the machine. Ammar wanted
+  snapshots built from the discovery engine's already-collected data
+  instead -- "what A1 already knows," not a fresh, separate OS read
+  taken out of band from any actual scan. v0.2.0 reads the interface's
+  state out of a specific A6 scan (`--scan-id`) or the most recent one
+  by default, and raises a clear error rather than falling back to a
+  live OS read if A6 has no scans yet -- that fallback is exactly the
+  behavior being removed, not a safety net worth keeping.
+  Two real benefits beyond just "don't touch the OS twice": every
+  snapshot now carries provenance via A6 v0.3.0's new
+  `source_scan_id` (which exact scan justified taking it, visible in
+  `--list-snapshots`), and `take_snapshot()` no longer needs A1 at all
+  -- only A6.
+  **What deliberately did not change:** `restore_snapshot()` still
+  reads live OS state twice (idempotency check, then post-restore
+  verification), and `verify_reachability_and_maybe_rollback()` still
+  checks live gateway/internet reachability. Neither can be answered
+  from stored discovery data -- "is this true right now" is exactly
+  what they need to know, and Ammar's request was specifically about
+  where the snapshot's own state comes from, not restore's
+  verification step.
+  Verified end-to-end in this sandbox: ran A1 `--cache` for a real
+  scan, took a snapshot of a real (virtual, throwaway) interface from
+  that exact scan's data, broke the interface manually, restored it,
+  confirmed it matched the snapshot again -- and confirmed
+  `--list-snapshots` shows which scan each snapshot came from. Also
+  confirmed `take_snapshot()` now fails cleanly with no OS query
+  attempted if A6 has no scans yet, and that referencing an interface
+  not present in the given scan, or an unknown scan id, both produce
+  clean errors rather than crashes.
 
 Everything else (A3, A5, A7, the Credential Manager, AI1) is not
 started yet.
@@ -720,7 +763,7 @@ started yet.
   DNS-not-resolving, firewall correlation (including the v0.6.0 "ALL"
   blanket-block branch), and the other rules still need a real scenario
   that actually triggers them before they're considered hardware-checked.
-- **Re-test A4 v0.1.0 against Ammar's real Windows hardware** — verified
+- **Re-test A4 v0.2.0 against Ammar's real Windows hardware** — verified
   in this sandbox against a real Linux virtual interface, but the
   Windows `netsh interface set interface admin=enable/disable` command
   path (what Ammar will actually use) is not yet confirmed on real

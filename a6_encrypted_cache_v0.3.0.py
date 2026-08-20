@@ -3,8 +3,33 @@
 a6_encrypted_cache.py -- Module A6 (Encrypted local cache) of the offline
 network diagnostic app.
 
-VERSION: 0.2.0
+VERSION: 0.3.0
 CHANGELOG:
+  0.3.0 - Two additions, both driven by the same A4 redesign: Ammar
+          wanted A4's snapshots built from the discovery engine's
+          already-collected data, not from a fresh, separate OS query
+          at snapshot time (see A4 v0.2.0's own changelog for the full
+          reasoning).
+
+          `get_scan(scan_id)`: a direct id lookup for the scans table,
+          same shape as v0.2.0's `get_snapshot(id)`. This closes a gap
+          flagged twice already (A2 v0.7.0's changelog, and A4 v0.1.0's
+          own snapshot code) but never fixed, since nothing needed it
+          yet -- A4's new take_snapshot() is the first real caller.
+
+          `snapshots.source_scan_id`: a new nullable column recording
+          which A1 scan a snapshot's state was read from, so a
+          snapshot now carries its own provenance (which scan justified
+          it) instead of being a freestanding capture with no link back
+          to what was actually detected. `write_snapshot()` accepts it
+          as an optional argument; existing rows (source_scan_id NULL)
+          are unaffected, this isn't a breaking change to v0.2.0 data.
+
+          Verified: extended `--selftest` to write a snapshot with a
+          source_scan_id and confirm get_scan()/get_snapshot() both
+          round-trip correctly and the canary still never appears in
+          plaintext.
+
   0.2.0 - Adds a `snapshots` table for A4 (Snapshot/Rollback Manager),
           the next module now being built. Same reasoning as v0.1.0's
           own scope decision: only add a table when the module that
@@ -162,11 +187,13 @@ CREATE TABLE IF NOT EXISTS snapshots (
     target TEXT NOT NULL,
     snapshot_type TEXT NOT NULL,
     restored_at TEXT,
+    source_scan_id INTEGER REFERENCES scans(id),
     payload BLOB NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_target ON snapshots(target);
 CREATE INDEX IF NOT EXISTS idx_snapshots_type ON snapshots(snapshot_type);
+CREATE INDEX IF NOT EXISTS idx_snapshots_source_scan_id ON snapshots(source_scan_id);
 """
 
 
@@ -260,13 +287,23 @@ class A6Cache:
             "ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        return [
-            {
-                "id": r[0], "scanned_at": r[1], "source_version": r[2],
-                "discovery": self._decrypt(r[3]),
-            }
-            for r in rows
-        ]
+        return [self._scan_row_to_dict(r) for r in rows]
+
+    def get_scan(self, scan_id):
+        """Direct lookup by id. Returns None if no such scan exists."""
+        row = self._conn.execute(
+            "SELECT id, scanned_at, source_version, payload FROM scans WHERE id = ?",
+            (scan_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._scan_row_to_dict(row)
+
+    def _scan_row_to_dict(self, row):
+        return {
+            "id": row[0], "scanned_at": row[1], "source_version": row[2],
+            "discovery": self._decrypt(row[3]),
+        }
 
     def get_findings(self, scan_id=None, severity=None, category=None, fix_classification=None):
         query = (
@@ -293,18 +330,22 @@ class A6Cache:
             })
         return results
 
-    def write_snapshot(self, target, snapshot_type, state, reason=None, created_at=None):
+    def write_snapshot(self, target, snapshot_type, state, reason=None,
+                        source_scan_id=None, created_at=None):
         """
         Stores one point-in-time capture of local state (e.g. one
         interface's admin_enabled/connected/mtu) before something is
-        about to change it. Returns the new snapshot's id.
+        about to change it. source_scan_id (new in v0.3.0) records which
+        A1 scan the state was read from, if any -- provenance for "what
+        did we actually detect that justified this". Returns the new
+        snapshot's id.
         """
         created_at = created_at or datetime.now(timezone.utc).isoformat()
         payload = self._encrypt({"state": state, "reason": reason})
         cur = self._conn.execute(
-            "INSERT INTO snapshots (created_at, target, snapshot_type, payload) "
-            "VALUES (?, ?, ?, ?)",
-            (created_at, target, snapshot_type, payload),
+            "INSERT INTO snapshots (created_at, target, snapshot_type, source_scan_id, payload) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (created_at, target, snapshot_type, source_scan_id, payload),
         )
         self._conn.commit()
         return cur.lastrowid
@@ -312,7 +353,7 @@ class A6Cache:
     def get_snapshot(self, snapshot_id):
         """Direct lookup by id. Returns None if no such snapshot exists."""
         row = self._conn.execute(
-            "SELECT id, created_at, target, snapshot_type, restored_at, payload "
+            "SELECT id, created_at, target, snapshot_type, restored_at, source_scan_id, payload "
             "FROM snapshots WHERE id = ?",
             (snapshot_id,),
         ).fetchone()
@@ -322,7 +363,7 @@ class A6Cache:
 
     def get_snapshots(self, target=None, snapshot_type=None, limit=10):
         query = (
-            "SELECT id, created_at, target, snapshot_type, restored_at, payload "
+            "SELECT id, created_at, target, snapshot_type, restored_at, source_scan_id, payload "
             "FROM snapshots WHERE 1=1"
         )
         params = []
@@ -336,10 +377,11 @@ class A6Cache:
         return [self._snapshot_row_to_dict(r) for r in self._conn.execute(query, params).fetchall()]
 
     def _snapshot_row_to_dict(self, row):
-        decrypted = self._decrypt(row[5])
+        decrypted = self._decrypt(row[6])
         return {
             "id": row[0], "created_at": row[1], "target": row[2], "snapshot_type": row[3],
-            "restored_at": row[4], "state": decrypted["state"], "reason": decrypted["reason"],
+            "restored_at": row[4], "source_scan_id": row[5],
+            "state": decrypted["state"], "reason": decrypted["reason"],
         }
 
     def mark_snapshot_restored(self, snapshot_id, restored_at=None):
@@ -396,17 +438,21 @@ def _selftest(db_path, key_path):
             snapshot_id = cache.write_snapshot(
                 target=plain_marker, snapshot_type="selftest",
                 state={"admin_enabled": True, "marker": secret_marker}, reason=secret_marker,
+                source_scan_id=scan_id,
             )
 
+            scan_direct = cache.get_scan(scan_id)
             scans = cache.get_scans(limit=1)
             findings = cache.get_findings(scan_id=scan_id)
             snapshot = cache.get_snapshot(snapshot_id)
 
+        assert scan_direct["discovery"]["canary"] == secret_marker, "get_scan(id) round-trip mismatch"
         assert scans[0]["discovery"]["canary"] == secret_marker, "scan round-trip mismatch"
         assert findings[0]["target"] == secret_marker, "finding round-trip mismatch"
         assert snapshot["target"] == plain_marker, "snapshot round-trip mismatch"
         assert snapshot["reason"] == secret_marker, "snapshot reason round-trip mismatch"
         assert snapshot["state"]["marker"] == secret_marker, "snapshot state round-trip mismatch"
+        assert snapshot["source_scan_id"] == scan_id, "snapshot source_scan_id round-trip mismatch"
 
         raw_bytes = Path(db_path).read_bytes()
         if secret_marker.encode() in raw_bytes:
@@ -492,8 +538,9 @@ def main():
                     print("No snapshots match.")
                 for s in snaps:
                     restored = f"restored {s['restored_at']}" if s["restored_at"] else "not restored"
+                    source = f"scan={s['source_scan_id']}" if s["source_scan_id"] is not None else "scan=-"
                     print(f"[{s['id']}] {s['created_at']}  {s['snapshot_type']:<24} "
-                          f"target={s['target']:<12} {restored}")
+                          f"target={s['target']:<12} {source:<9} {restored}")
     except CacheError as e:
         print(f"Cache error: {e}", file=sys.stderr)
         return 1
