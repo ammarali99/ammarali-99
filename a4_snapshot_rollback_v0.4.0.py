@@ -3,8 +3,241 @@
 a4_snapshot_rollback.py -- Module A4 (Snapshot / Rollback Manager) of the
 offline network diagnostic app.
 
-VERSION: 0.3.0
+VERSION: 0.4.0
 CHANGELOG:
+  0.4.0 - Three new diff_against_scan()/rollback() categories, plus two
+          new one-shot corrective actions outside the diff engine
+          (matching fix_firewall_rule()'s shape), all built against A1
+          v0.15.0's newly-added unconditional-every-scan fields.
+
+          New diff/rollback categories:
+
+            - hosts_file_entries: baseline is A1's read_hosts_file()
+              output, already stored in every scan (A1 v0.15.0 runs it
+              unconditionally, not gated by a skip flag, specifically so
+              a baseline is always available here). Diff compares every
+              *active* live entry against the baseline's active entries
+              by (ip, sorted hostnames); anything present live but not
+              in the baseline is "added since baseline" and gets its own
+              difference (one difference per new entry, not one for the
+              whole file -- keeps the existing per-diff dispatch/report
+              machinery working unchanged, and means one entry's line
+              somehow failing to match on removal doesn't lose track of
+              the others). Deliberately one-directional: this only
+              removes what got *added*, never restores what's *missing*
+              from the live file relative to baseline -- restoring
+              missing entries would mean re-inventing content A4 didn't
+              itself remove and doesn't know is safe to re-add, a
+              materially riskier direction than "undo what changed
+              recently," which is this whole module's operating
+              philosophy. _set_hosts_file_entries() is a plain file
+              edit, not a subprocess call -- reads the hosts file,
+              drops only the lines matching the entries to remove
+              (matched by exact line_raw text, the same processing A1's
+              read_hosts_file() used to capture it, so the two stay
+              comparable), and writes every other line back completely
+              unmodified. Same path logic as A1: Windows
+              %SystemRoot%\\System32\\drivers\\etc\\hosts, Linux/macOS
+              /etc/hosts.
+
+            - system_proxy_config: baseline/live via A1's
+              get_system_proxy_config() (also unconditional every scan
+              in A1 v0.15.0), compared field-by-field per platform
+              (Windows: proxy_enabled/proxy_server; Linux:
+              http_proxy/https_proxy; macOS: the HTTPEnable/HTTPProxy/
+              HTTPPort/HTTPSEnable/HTTPSProxy/HTTPSPort keys scutil
+              --proxy exposes). Windows and macOS differences are marked
+              revertible; Linux differences are always marked
+              *non-revertible*, with an explanatory note, on purpose --
+              the fields that actually differ on Linux (http_proxy/
+              https_proxy) are environment variables of already-running
+              processes, which cannot be changed from outside them by
+              any mechanism, gsettings included. Marking that revertible
+              would have meant reporting a rollback as having "fixed"
+              something it structurally cannot fix -- exactly the kind
+              of confidently-wrong behavior this codebase keeps flagging
+              and avoiding, so it's surfaced for visibility only, same
+              treatment as the existing interface_missing case.
+              _set_system_proxy_config(enabled, server=None,
+              service=None): Windows writes ProxyEnable/ProxyServer
+              directly via winreg to the same registry key A1 reads --
+              deliberately NOT paired with the ctypes/WinINet
+              InternetSetOption(INTERNET_OPTION_REFRESH) broadcast that
+              would make an already-open browser notice immediately;
+              flagged as a possible future addition, same caution class
+              as this file's existing _set_wifi_radio_windows(), not
+              built this round to keep this a plain, low-risk registry
+              write (a currently-open browser may need restarting to
+              notice). Linux is explicitly best-effort and GNOME-only
+              via `gsettings set org.gnome.system.proxy ...` -- stated
+              plainly in both the docstring and the returned message
+              that it cannot touch the env-var-based proxy config that
+              actually matters, and returns False outright (rather than
+              a silent no-op) if gsettings itself isn't even present.
+              macOS uses `networksetup -setwebproxystate`/
+              `-setsecurewebproxystate ... off` -- disabling only;
+              re-enabling a specific proxy server on macOS needs a
+              different, more involved command shape
+              (-setwebproxy/-setsecurewebproxy with host+port+auth) not
+              specified for this round and not built. A new
+              _macos_all_network_services() helper (via `networksetup
+              -listallnetworkservices`) is used when no specific service
+              name is available, since macOS has no single system-wide
+              proxy switch, only a per-service one.
+
+            - wifi_power_management (Linux-only): baseline/live via A1's
+              get_wifi_power_management(), which is itself Linux-only by
+              A1's own explicit product decision (no clean,
+              non-guessing source exists on Windows/macOS -- see that
+              function's docstring). Only ever compared/diffed when
+              SYSTEM == "Linux" and both baseline and live came back
+              non-None -- skipped entirely otherwise, the same
+              don't-guess-when-data-is-missing discipline this file
+              already applies elsewhere (e.g. interface_dns's Linux
+              nmcli-connection-name gap). _set_wifi_power_management()
+              finds the wireless interface via A1's own
+              _linux_wifi_interface_name() helper -- reused rather than
+              reimplemented, so the read and write sides can never
+              disagree about which interface is "the" Wi-Fi interface --
+              then runs `iw dev <iface> set power_save on|off`.
+
+          New one-shot corrective actions (outside the diff engine,
+          same shape as fix_firewall_rule()/fix_firewall_finding() --
+          a pure engine function plus a thin CLI-facing wrapper):
+
+            - flush_dns_cache() / run_flush_dns_cache(): Windows
+              `ipconfig /flushdns`; Linux tries `systemd-resolve
+              --flush-caches` first, falls back to `resolvectl
+              flush-caches` (the current, non-deprecated name) if the
+              first isn't found, and returns False with a clear message
+              if NEITHER exists rather than claiming success; macOS
+              runs both `dscacheutil -flushcache` and `killall -HUP
+              mDNSResponder`, commonly needed together for a full flush
+              there.
+
+            - sync_system_clock() / run_sync_system_clock(): Windows
+              `w32tm /resync`, with a distinct message if the error text
+              looks like the Windows Time service itself isn't running
+              (vs. a generic failure); Linux `timedatectl set-ntp true`,
+              plus `chronyc makestep` *only* when chrony is detected as
+              the actually-active service -- via the same `chronyc
+              tracking`-succeeds check A1's check_clock_drift() already
+              uses, reused rather than reinvented, so this and that read
+              can never disagree about whether chrony is active; macOS
+              `sntp -sS time.apple.com`, which genuinely queries a real
+              NTP server and steps the clock immediately -- unlike A1's
+              read-only check_clock_drift(), which deliberately never
+              makes a live NTP query. That's fine here and isn't a sixth
+              instance of A1's "narrow internet exception" framework:
+              A4's fix actions are a different category from A1's
+              diagnostic reads, and are allowed a real corrective
+              outbound call when the fix genuinely requires one.
+
+          NEW DECISION THIS ROUND, applied to both one-shot actions:
+          unlike fix_firewall_rule() (which today writes nothing to
+          A6), flush_dns_cache and sync_system_clock now ALWAYS write an
+          A6 audit row (snapshot_type="one_shot_action") recording what
+          was attempted and whether it worked -- success or failure
+          alike -- matching rollback()'s existing "the app changed
+          something, always log it" philosophy. Each action is split
+          into a pure engine function (flush_dns_cache(),
+          sync_system_clock() -- no A6 involvement, trivially callable/
+          testable standalone) and a thin wrapper
+          (run_flush_dns_cache(), run_sync_system_clock() -- calls the
+          engine function, then writes the audit row) that the CLI
+          actually calls. fix_firewall_rule() is deliberately NOT
+          retrofitted to also log this round -- noted here as a real,
+          known inconsistency between it and these two new actions,
+          left for a future pass rather than snuck into this one.
+
+          Verified in this sandbox, stated precisely about what was and
+          wasn't real (this sandbox has no systemd/D-Bus running as
+          PID 1, no `iw`, no `chronyc`, and no `systemd-resolve`/
+          `resolvectl` -- several of the honest, real failures below are
+          a direct result of that, not a code bug):
+
+            - _set_hosts_file_entries(): fully real, against a throwaway
+              file at /tmp/test_hosts_a4 (never against the real
+              /etc/hosts) -- built a file with several entries, called
+              the function (via its _path_override testing hook) to
+              remove a subset by line_raw, confirmed exactly the
+              targeted lines were gone and every other line came back
+              byte-for-byte identical to the original (diffed against a
+              saved copy). Also confirmed this sandbox's real /etc/hosts
+              is byte-identical before and after this whole round of
+              work (md5sum compared).
+            - flush_dns_cache(): fully real on this sandbox's actual
+              Linux path -- neither `systemd-resolve` nor `resolvectl`
+              is installed here, so it correctly returned False with
+              the "no known DNS cache management tool found" message
+              instead of a false success. run_flush_dns_cache() was
+              also run for real end-to-end: confirmed the resulting
+              audit row (ok=False, that exact message) landed in A6 via
+              get_snapshots(snapshot_type="one_shot_action").
+            - sync_system_clock(): the `timedatectl set-ntp true` call
+              itself ran for real and failed for real -- "Failed to
+              connect to bus: Connection refused", because this
+              container has no systemd/D-Bus running as PID 1 (`ps -p 1`
+              shows a plain "process_api", not systemd). Confirmed this
+              is a container-environment limitation, not a parsing bug,
+              by checking `timedatectl status` fails identically outside
+              this function. `chronyc` isn't installed here either, so
+              the chrony-detection branch was exercised for real too
+              (FileNotFoundError caught, chrony step correctly skipped).
+              run_sync_system_clock() end-to-end: confirmed the
+              resulting audit row (ok=False, the timedatectl error
+              message) landed in A6.
+            - hosts_file_entries/system_proxy_config diff logic: unit-
+              tested with synthetic baseline/live dicts shaped like real
+              A1 output (new entry present live and not in baseline
+              correctly produces one difference per entry; an entry
+              present in both correctly produces none; a Linux proxy
+              difference correctly comes back non-revertible with the
+              explanatory note; a Windows-shaped proxy difference
+              correctly comes back revertible) -- not against a live A1
+              scan, since this sandbox's own hosts file/proxy env
+              weren't deliberately changed to actually trigger these
+              (matches this round's safety discipline: no live edits to
+              this sandbox's real hosts file or its real proxy
+              environment, which per the environment notes routes
+              through a required agent proxy that must not be touched).
+            - _set_system_proxy_config(): command construction verified
+              by mocking subprocess.run for all three platforms. This
+              sandbox is Linux, so the Windows branch was checked by
+              inspecting the exact winreg.SetValueEx calls made for
+              known inputs via mocking (ctypes.windll-style unavailable
+              here, same limitation as this file's existing Windows-only
+              functions); the macOS branch was checked by inspecting the
+              exact networksetup command lines built. Linux's own
+              gsettings calls were also verified via mocking rather than
+              run for real, deliberately, per this round's explicit
+              instruction not to risk this container's actual proxy
+              environment -- even though gsettings is present here and a
+              real "mode: none" call would in fact be harmless, caution
+              was chosen over proving it.
+            - _set_wifi_power_management(): `iw` isn't installed in this
+              sandbox and there's no real wireless interface anyway --
+              confirmed it fails cleanly with a clear "no Wi-Fi
+              interface found" style message (the same
+              _linux_wifi_interface_name() "iw not installed" error A1's
+              own read side would hit) rather than crashing; the actual
+              `iw dev ... set power_save` command line was verified via
+              mocking, not run for real.
+            - wifi_power_management's diff-skip logic (SYSTEM != "Linux"
+              or either read is None) was exercised for real just by
+              running --diff in this sandbox: get_wifi_power_management()
+              genuinely returns None here (no wireless interface), so
+              the category correctly produced zero differences without
+              any special-casing needed in the test.
+            - eth0 confirmed unchanged before and after this entire
+              round (`ip -o link show eth0` compared byte-for-byte) --
+              nothing in this round's testing touched it or any real
+              interface; the only live interface work anywhere in this
+              codebase's testing has ever been the throwaway veth pair
+              from v0.3.0's rounds, and this round didn't need one at
+              all (none of the three new categories are interface-
+              admin-state/MTU work).
+
   0.3.0 - Ammar's explicit follow-up request, after v0.2.0: don't make
           the caller manually snapshot one named interface ahead of
           time at all. Instead, treat A6's already-stored scan history
@@ -236,6 +469,7 @@ CHANGELOG:
 """
 
 import argparse
+import os
 import platform
 import re
 import subprocess
@@ -761,6 +995,498 @@ def _set_wifi_radio_windows(enabled):
         return False, f"Unexpected error calling wlanapi: {e}"
 
 
+def _hosts_file_path():
+    """Same path logic as A1's read_hosts_file() -- kept in sync deliberately."""
+    if SYSTEM == "Windows":
+        return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                             "System32", "drivers", "etc", "hosts")
+    return "/etc/hosts"
+
+
+def _set_hosts_file_entries(entries_to_remove, _path_override=None):
+    """
+    Removes specific entries from the OS hosts file -- a plain file
+    edit, not a subprocess call. Only ever removes lines, never adds or
+    rewrites anything else: every kept line is written back byte-for-
+    byte as it was read, so a file with entries A/B/C and only B in
+    entries_to_remove comes out with exactly A and C untouched.
+
+    Matches each entry primarily by "line_raw" (the exact line text A1's
+    read_hosts_file() captured, using the same rstrip("\\n").rstrip("\\r")
+    processing so the two stay comparable) -- an exact match, not a
+    reconstruction, since reconstructing from ip+hostnames could
+    accidentally match a differently-formatted line with the same
+    meaning (extra whitespace, different casing) and remove the wrong
+    one. Falls back to matching by (ip, sorted hostnames) only for
+    entries that arrived without a line_raw (shouldn't normally happen,
+    since every entry read via read_hosts_file() has one, but this
+    keeps the function usable if called directly with a hand-built
+    entry).
+
+    _path_override exists only for testing -- it lets a test point this
+    at a throwaway file under /tmp instead of the real hosts file,
+    without needing to fake SYSTEM. Never set by any real caller in this
+    codebase.
+
+    Returns (ok, message).
+    """
+    if not entries_to_remove:
+        return True, "Nothing to remove from the hosts file."
+
+    path = _path_override or _hosts_file_path()
+    raw_targets = {e["line_raw"] for e in entries_to_remove if e.get("line_raw")}
+    key_targets = {
+        (e.get("ip"), tuple(sorted(e.get("hostnames") or [])))
+        for e in entries_to_remove if not e.get("line_raw")
+    }
+
+    try:
+        with open(path, "r", errors="ignore") as f:
+            raw_lines = f.readlines()
+
+        kept = []
+        removed = 0
+        for raw_line in raw_lines:
+            line = raw_line.rstrip("\n").rstrip("\r")
+            if line in raw_targets:
+                removed += 1
+                continue
+            if key_targets:
+                stripped = line.strip()
+                content = stripped.lstrip("#").strip() if stripped.startswith("#") else stripped
+                parts = content.split()
+                if len(parts) >= 2 and (parts[0], tuple(sorted(parts[1:]))) in key_targets:
+                    removed += 1
+                    continue
+            kept.append(raw_line)
+
+        with open(path, "w") as f:
+            f.writelines(kept)
+
+        return True, f"Removed {removed} entries from the hosts file"
+    except PermissionError:
+        priv = "Administrator" if SYSTEM == "Windows" else "root"
+        return False, f"Permission denied writing {path} -- this needs {priv}"
+    except OSError as e:
+        return False, f"Could not update the hosts file: {e}"
+
+
+def _macos_all_network_services():
+    """
+    Lists every macOS network service name via
+    `networksetup -listallnetworkservices` (e.g. "Wi-Fi",
+    "Thunderbolt Ethernet") -- used by _set_system_proxy_config() on
+    macOS when no specific service was given, since there's no single
+    "system-wide" proxy toggle on macOS, only a per-service one. Skips
+    the tool's own first line ("An asterisk (*) denotes that a network
+    service is disabled.") and strips the leading "*" macOS puts on
+    disabled services' names. Returns a list of names, [] on any
+    failure.
+    """
+    try:
+        result = subprocess.run(
+            ["networksetup", "-listallnetworkservices"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        return []
+    if result.returncode != 0:
+        return []
+    lines = result.stdout.splitlines()[1:]  # skip the asterisk-explanation header line
+    return [line.lstrip("*").strip() for line in lines if line.strip()]
+
+
+def _set_system_proxy_config(enabled, server=None, service=None):
+    """
+    Sets the OS's configured proxy state. Returns (ok, message).
+
+    Windows: writes ProxyEnable (DWORD) and, if given, ProxyServer
+    (string) directly to the same
+    HKCU\\...\\Internet Settings registry key A1's get_system_proxy_config()
+    reads from -- a plain registry write via the stdlib `winreg` module,
+    deliberately NOT paired with the ctypes/WinINet
+    InternetSetOption(INTERNET_OPTION_REFRESH) broadcast that would make
+    already-running apps notice immediately. That broadcast is flagged
+    as a possible future improvement, same caution class as this file's
+    existing _set_wifi_radio_windows() -- not built this round to keep
+    this a plain, low-risk registry write. A currently-open browser may
+    need to be restarted to notice the change.
+
+    Linux: best-effort, GNOME-only, via `gsettings set
+    org.gnome.system.proxy ...`. This is explicitly NOT a universal
+    Linux system-proxy mechanism -- there isn't one. It can never
+    change http_proxy/https_proxy environment variables of processes
+    that are already running, since a process's own environment can't
+    be altered from outside it once it has started; it only changes
+    the GNOME desktop's own proxy setting; and it does nothing at all
+    on a non-GNOME desktop or headless machine. If gsettings itself
+    isn't present, this returns False rather than silently no-opping.
+
+    macOS: `networksetup -setwebproxystate <service> off` and
+    -setsecurewebproxystate <service> off, per Apple's documented way
+    to disable a service's proxy. Only disabling is implemented --
+    re-enabling a specific proxy server/port on macOS would need a
+    different, more involved command shape
+    (-setwebproxy/-setsecurewebproxy with host+port+auth) that wasn't
+    specified for this round and isn't built. If no service name is
+    given, applies to every service networksetup reports via
+    _macos_all_network_services() (macOS has no single system-wide
+    proxy switch, only a per-service one).
+    """
+    try:
+        if SYSTEM == "Windows":
+            import winreg  # stdlib, Windows-only -- guarded the same way A1 does
+            try:
+                key = winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                    0, winreg.KEY_SET_VALUE,
+                )
+            except OSError as e:
+                return False, f"Could not open Internet Settings registry key for writing: {e}"
+            try:
+                winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1 if enabled else 0)
+                if server is not None:
+                    winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, server)
+            except OSError as e:
+                return False, f"Could not write proxy registry values: {e}"
+            finally:
+                winreg.CloseKey(key)
+            desc = f"ProxyEnable={1 if enabled else 0}"
+            if server is not None:
+                desc += f", ProxyServer={server!r}"
+            return True, (
+                f"Wrote {desc} under HKCU\\...\\Internet Settings -- a currently-open browser "
+                "may need to be restarted to notice the change (no InternetSetOption refresh "
+                "broadcast is sent, see docstring)"
+            )
+
+        elif SYSTEM == "Linux":
+            try:
+                mode_result = subprocess.run(
+                    ["gsettings", "set", "org.gnome.system.proxy", "mode",
+                     "manual" if enabled else "none"],
+                    capture_output=True, text=True, timeout=10,
+                )
+            except FileNotFoundError:
+                return False, ("no gsettings found -- Linux has no universal system-proxy "
+                                "mechanism this tool can reliably change")
+            if mode_result.returncode != 0:
+                err = (mode_result.stderr or mode_result.stdout).strip()
+                return False, f"gsettings set ... mode failed: {err}"
+
+            note = (" (GNOME-only -- this does not and cannot change http_proxy/https_proxy "
+                     "environment variables of already-running processes)")
+            if not enabled:
+                return True, "Ran: gsettings set org.gnome.system.proxy mode 'none'" + note
+
+            if server:
+                host, _, port = server.partition(":")
+                for scheme in ("http", "https"):
+                    host_result = subprocess.run(
+                        ["gsettings", "set", f"org.gnome.system.proxy.{scheme}", "host", host],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if host_result.returncode != 0:
+                        err = (host_result.stderr or host_result.stdout).strip()
+                        return False, f"gsettings set proxy.{scheme} host failed: {err}"
+                    if port:
+                        port_result = subprocess.run(
+                            ["gsettings", "set", f"org.gnome.system.proxy.{scheme}", "port", port],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        if port_result.returncode != 0:
+                            err = (port_result.stderr or port_result.stdout).strip()
+                            return False, f"gsettings set proxy.{scheme} port failed: {err}"
+            return True, (f"Ran: gsettings set org.gnome.system.proxy mode 'manual' "
+                           f"(host/port set from {server!r})" + note)
+
+        elif SYSTEM == "Darwin":
+            if enabled:
+                return False, (
+                    "Re-enabling a specific proxy server isn't implemented for macOS -- only "
+                    "disabling is (-setwebproxystate/-setsecurewebproxystate off). Restoring a "
+                    "specific proxy server+port needs -setwebproxy/-setsecurewebproxy with "
+                    "host+port+auth, a different command shape not built this round."
+                )
+            services = [service] if service else _macos_all_network_services()
+            if not services:
+                return False, "Could not determine any macOS network service names to clear the proxy on"
+            failures = []
+            for svc in services:
+                for flag in ("-setwebproxystate", "-setsecurewebproxystate"):
+                    result = subprocess.run(
+                        ["networksetup", flag, svc, "off"],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    if result.returncode != 0:
+                        err = (result.stderr or result.stdout).strip()
+                        failures.append(f"{svc} ({flag}): {err}")
+            if failures:
+                return False, "networksetup proxy-disable failed for: " + "; ".join(failures) + " -- this needs admin"
+            return True, f'Ran: networksetup -setwebproxystate/-setsecurewebproxystate off for {", ".join(services)}'
+
+        return False, f"Unsupported platform: {SYSTEM}"
+    except FileNotFoundError as e:
+        return False, f"Required command not found: {e}"
+    except subprocess.SubprocessError as e:
+        return False, f"Command failed: {e}"
+
+
+def _set_wifi_power_management(enabled):
+    """
+    Turns Linux Wi-Fi power-save on/off via `iw dev <iface> set
+    power_save on|off` -- the write-side counterpart to A1's
+    get_wifi_power_management(), Linux-only for the exact same reason
+    that read function is Linux-only (see its docstring): no clean,
+    non-guessing source exists on Windows (PowerShell-only) or macOS
+    (tied to system-wide Energy Saver, no discrete per-adapter CLI
+    toggle). Finds the wireless interface the same way A1 does, via
+    A1's own `_linux_wifi_interface_name()` helper -- reused rather
+    than re-implemented, so this and the read side can never disagree
+    about which interface is "the" Wi-Fi interface. Returns (ok, message).
+    """
+    if SYSTEM != "Linux":
+        return False, (
+            "Wi-Fi power-management is only settable on Linux -- no clean, non-guessing source "
+            "exists on Windows/macOS (see A1's get_wifi_power_management() docstring for the "
+            "same reasoning on the read side)."
+        )
+    a1 = _load_a1()
+    errors = []
+    iface = a1._linux_wifi_interface_name(errors)
+    if not iface:
+        detail = f" ({'; '.join(errors)})" if errors else ""
+        return False, f"No Wi-Fi interface found on this machine{detail}"
+    try:
+        state = "on" if enabled else "off"
+        result = subprocess.run(
+            ["iw", "dev", iface, "set", "power_save", state],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout).strip()
+            return False, f"iw dev {iface} set power_save {state} failed: {err} -- this usually needs root"
+        return True, f"Ran: iw dev {iface} set power_save {state}"
+    except FileNotFoundError as e:
+        return False, f"Required command not found: {e}"
+    except subprocess.SubprocessError as e:
+        return False, f"Command failed: {e}"
+
+
+def flush_dns_cache():
+    """
+    One-shot corrective action, OUTSIDE the diff/rollback engine (same
+    class as fix_firewall_rule()) -- flushes the OS's DNS resolver
+    cache. Pure engine function: no A6 involvement here, so it stays
+    trivially callable/testable on its own; run_flush_dns_cache() below
+    is the A6-logging wrapper the CLI actually calls.
+
+    Windows: `ipconfig /flushdns`.
+
+    Linux: tries `systemd-resolve --flush-caches` first, then falls
+    back to `resolvectl flush-caches` if the first isn't found --
+    `resolvectl` is the current tool name, `systemd-resolve` is the
+    deprecated alias some systems still only ship. If NEITHER exists,
+    returns False rather than claiming success -- a machine not using
+    systemd-resolved at all has no DNS cache this function knows how to
+    flush, and pretending otherwise would be exactly the kind of
+    confidently-wrong report this codebase keeps flagging and avoiding
+    elsewhere.
+
+    macOS: runs BOTH `dscacheutil -flushcache` AND `killall -HUP
+    mDNSResponder` -- commonly needed together for a full flush on
+    macOS, since dscacheutil clears the resolver's own cache and
+    HUP-ing mDNSResponder clears its separate one.
+
+    Returns (ok, message).
+    """
+    try:
+        if SYSTEM == "Windows":
+            result = subprocess.run(
+                ["ipconfig", "/flushdns"],
+                capture_output=True, text=True, errors="ignore", timeout=15,
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout).strip()
+                return False, f"ipconfig /flushdns failed: {err}"
+            return True, "Ran: ipconfig /flushdns"
+
+        elif SYSTEM == "Linux":
+            for cmd in (["systemd-resolve", "--flush-caches"], ["resolvectl", "flush-caches"]):
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                except FileNotFoundError:
+                    continue
+                if result.returncode != 0:
+                    err = (result.stderr or result.stdout).strip()
+                    return False, f"{' '.join(cmd)} failed: {err}"
+                return True, f"Ran: {' '.join(cmd)}"
+            return False, "no known DNS cache management tool found on this system (tried systemd-resolve, resolvectl)"
+
+        elif SYSTEM == "Darwin":
+            result1 = subprocess.run(
+                ["dscacheutil", "-flushcache"], capture_output=True, text=True, timeout=15,
+            )
+            if result1.returncode != 0:
+                err = (result1.stderr or result1.stdout).strip()
+                return False, f"dscacheutil -flushcache failed: {err} -- this may need admin"
+            result2 = subprocess.run(
+                ["killall", "-HUP", "mDNSResponder"], capture_output=True, text=True, timeout=15,
+            )
+            if result2.returncode != 0:
+                err = (result2.stderr or result2.stdout).strip()
+                return False, f"killall -HUP mDNSResponder failed: {err} -- this usually needs admin"
+            return True, "Ran: dscacheutil -flushcache && killall -HUP mDNSResponder"
+
+        return False, f"Unsupported platform: {SYSTEM}"
+    except FileNotFoundError as e:
+        return False, f"Required command not found: {e}"
+    except subprocess.SubprocessError as e:
+        return False, f"Command failed: {e}"
+
+
+def run_flush_dns_cache(cache_db=None, cache_key=None):
+    """
+    CLI-friendly wrapper: calls flush_dns_cache(), then always writes an
+    A6 audit row recording the attempt -- success or failure alike.
+    Unlike fix_firewall_rule() (which today logs nothing to A6, a known
+    inconsistency flagged in this version's changelog, not fixed this
+    round), this one-shot action always logs, matching rollback()'s "the
+    app changed something, always log it" philosophy. No id-based
+    lookup is needed here (unlike fix_firewall_finding()), since this
+    action doesn't target anything specific -- it's a direct call.
+    Returns (ok, message).
+    """
+    ok, message = flush_dns_cache()
+    try:
+        with _load_a6_cache(cache_db, cache_key) as cache:
+            cache.write_snapshot(
+                target="dns_cache", snapshot_type="one_shot_action",
+                state={"action": "flush_dns_cache", "ok": ok, "message": message},
+                reason="DNS cache flush requested", source_scan_id=None,
+            )
+    except A4Error as e:
+        message += f" (warning: could not write A6 audit row: {e})"
+    return ok, message
+
+
+def sync_system_clock():
+    """
+    One-shot corrective action, OUTSIDE the diff/rollback engine, same
+    class as flush_dns_cache() -- forces a clock resync. Pure engine
+    function, no A6 involvement; run_sync_system_clock() below is the
+    A6-logging wrapper the CLI actually calls.
+
+    Windows: `w32tm /resync`. If the Windows Time service (w32time)
+    itself is stopped, that's a distinct, more specific failure than a
+    generic sync error -- detected by looking for "not started"/
+    "service is not running"-shaped text in the command's own error
+    output and messaged distinctly (start the service first), rather
+    than folded into a generic failure message.
+
+    Linux: `timedatectl set-ntp true` as the primary action. Only if
+    chrony is detected as the actually-active time-sync service --
+    `chronyc tracking` succeeding, the exact same detection A1's
+    check_clock_drift() already uses, reused here rather than
+    reinvented -- also runs `chronyc makestep` to force an immediate
+    step instead of waiting for chrony's normal gradual correction.
+    chrony-specific commands are never invoked if chrony isn't the
+    active service (chronyc simply not being installed is normal, not
+    an error, same as check_clock_drift()'s own handling).
+
+    macOS: `sntp -sS time.apple.com` -- this genuinely steps the clock
+    immediately by querying a real NTP server, unlike A1's read-only
+    check_clock_drift(), which deliberately never makes a live NTP
+    query. That's fine here: A4's fix actions are allowed to make a
+    real corrective outbound call when the fix genuinely requires one
+    -- this isn't part of A1's "narrow exception" framework for
+    diagnostic reads, it's a different category, a fix actually doing
+    the thing it's named for.
+
+    Returns (ok, message).
+    """
+    try:
+        if SYSTEM == "Windows":
+            result = subprocess.run(
+                ["w32tm", "/resync"], capture_output=True, text=True, errors="ignore", timeout=30,
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout).strip()
+                if "not started" in err.lower() or "service is not running" in err.lower():
+                    return False, (f"w32tm /resync failed: {err} -- the Windows Time service "
+                                    "(w32time) isn't running; start it first "
+                                    "(services.msc, or 'net start w32time' as Administrator)")
+                return False, (f"w32tm /resync failed: {err} -- this usually needs an elevated "
+                                "(Administrator) Command Prompt")
+            return True, "Ran: w32tm /resync"
+
+        elif SYSTEM == "Linux":
+            result = subprocess.run(
+                ["timedatectl", "set-ntp", "true"], capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout).strip()
+                return False, (f"timedatectl set-ntp true failed: {err} -- this needs root, and "
+                                "can also fail in a container where systemd isn't running as "
+                                "PID 1 / no D-Bus is available, a container-environment quirk "
+                                "rather than a code bug")
+            messages = ["Ran: timedatectl set-ntp true"]
+            try:
+                chrony_check = subprocess.run(
+                    ["chronyc", "tracking"], capture_output=True, text=True, timeout=10,
+                )
+                chrony_active = chrony_check.returncode == 0
+            except FileNotFoundError:
+                chrony_active = False  # chrony isn't the active time-sync service -- not an error
+            if chrony_active:
+                try:
+                    step_result = subprocess.run(
+                        ["chronyc", "makestep"], capture_output=True, text=True, timeout=15,
+                    )
+                    if step_result.returncode == 0:
+                        messages.append("Ran: chronyc makestep")
+                    else:
+                        err = (step_result.stderr or step_result.stdout).strip()
+                        messages.append(f"chronyc makestep failed: {err}")
+                except FileNotFoundError:
+                    pass
+            return True, "; ".join(messages)
+
+        elif SYSTEM == "Darwin":
+            result = subprocess.run(
+                ["sntp", "-sS", "time.apple.com"], capture_output=True, text=True, timeout=20,
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout).strip()
+                return False, (f"sntp -sS time.apple.com failed: {err} -- this usually needs "
+                                "admin, and needs internet reachability to time.apple.com")
+            return True, "Ran: sntp -sS time.apple.com (stepped the clock immediately)"
+
+        return False, f"Unsupported platform: {SYSTEM}"
+    except FileNotFoundError as e:
+        return False, f"Required command not found: {e}"
+    except subprocess.SubprocessError as e:
+        return False, f"Command failed: {e}"
+
+
+def run_sync_system_clock(cache_db=None, cache_key=None):
+    """CLI-friendly wrapper: calls sync_system_clock(), then always
+    writes an A6 audit row recording the attempt, same reasoning as
+    run_flush_dns_cache(). Returns (ok, message)."""
+    ok, message = sync_system_clock()
+    try:
+        with _load_a6_cache(cache_db, cache_key) as cache:
+            cache.write_snapshot(
+                target="system_clock", snapshot_type="one_shot_action",
+                state={"action": "sync_system_clock", "ok": ok, "message": message},
+                reason="System clock sync requested", source_scan_id=None,
+            )
+    except A4Error as e:
+        message += f" (warning: could not write A6 audit row: {e})"
+    return ok, message
+
+
 def _get_baseline_scan(scan_id, cache):
     if scan_id is not None:
         scan = cache.get_scan(scan_id)
@@ -782,14 +1508,16 @@ def diff_against_scan(scan_id=None, cache_db=None, cache_key=None):
     "connection_name" (only for interface_dns/interface_ip_mode)}.
 
     Scope: interface admin_enabled, interface MTU, per-interface DNS,
-    per-interface static/DHCP mode (+ values), and the Wi-Fi radio's
-    software state -- the fields A1 discovers that are actually local
-    "settings" in the sense of something to revert. Everything else A1
-    discovers (devices seen, nearby Wi-Fi networks, gateway latency,
-    pool usage, firewall rules, router/UPnP data) is either a live
-    metric that fluctuates on its own, an observation rather than a
-    setting, or (firewall rules, router config) handled through a
-    separate, more careful mechanism -- see fix_firewall_rule().
+    per-interface static/DHCP mode (+ values), the Wi-Fi radio's
+    software state, hosts-file entries added since the baseline, the
+    system proxy configuration, and (Linux-only) Wi-Fi power-save state
+    -- the fields A1 discovers that are actually local "settings" in the
+    sense of something to revert. Everything else A1 discovers (devices
+    seen, nearby Wi-Fi networks, gateway latency, pool usage, firewall
+    rules, router/UPnP data) is either a live metric that fluctuates on
+    its own, an observation rather than a setting, or (firewall rules,
+    router config) handled through a separate, more careful mechanism --
+    see fix_firewall_rule().
     """
     a1 = _load_a1()
     with _load_a6_cache(cache_db, cache_key) as cache:
@@ -872,6 +1600,71 @@ def diff_against_scan(scan_id=None, cache_db=None, cache_key=None):
             "baseline": b_soft, "current": c_soft, "revertible": True, "note": None,
         })
 
+    live_hosts, _ = a1.read_hosts_file()
+    baseline_hosts = baseline.get("hosts_file", [])
+
+    def _hosts_key(entry):
+        return (entry.get("ip"), tuple(sorted(entry.get("hostnames") or [])))
+
+    baseline_active_keys = {_hosts_key(e) for e in baseline_hosts if e.get("active")}
+    for entry in live_hosts:
+        if not entry.get("active"):
+            continue
+        if _hosts_key(entry) in baseline_active_keys:
+            continue
+        # One difference per new entry, not one difference for the whole
+        # file -- keeps _print_differences()/rollback()'s per-diff
+        # dispatch working unchanged, and means a partial failure (one
+        # entry's line somehow can't be matched on removal) doesn't lose
+        # track of the others.
+        target = ", ".join(entry.get("hostnames") or []) or entry.get("ip") or "?"
+        differences.append({
+            "category": "hosts_file_entries", "target": target,
+            "baseline": None, "current": entry, "revertible": True, "note": None,
+        })
+
+    live_proxy, _ = a1.get_system_proxy_config()
+    baseline_proxy = baseline.get("system_proxy_config") or {}
+    if SYSTEM == "Windows":
+        proxy_fields = ("proxy_enabled", "proxy_server")
+    elif SYSTEM == "Linux":
+        proxy_fields = ("http_proxy", "https_proxy")
+    elif SYSTEM == "Darwin":
+        proxy_fields = ("HTTPEnable", "HTTPProxy", "HTTPPort", "HTTPSEnable", "HTTPSProxy", "HTTPSPort")
+    else:
+        proxy_fields = ()
+    if proxy_fields and any(baseline_proxy.get(f) != live_proxy.get(f) for f in proxy_fields):
+        revertible, note = True, None
+        if SYSTEM == "Linux":
+            # The fields that actually differ here (http_proxy/https_proxy)
+            # are environment variables -- there is no clean way to revert
+            # those from outside the processes that already read them.
+            # gsettings (what _set_system_proxy_config() can actually do
+            # on Linux) only ever touches the separate GNOME desktop proxy
+            # setting, not these env vars, so marking this revertible
+            # would be dishonest about what a rollback here would really
+            # do -- surfaced for visibility instead, same as
+            # interface_missing above.
+            revertible, note = False, (
+                "Linux has no clean way to revert http_proxy/https_proxy -- those are "
+                "environment variables of already-running processes, which can't be "
+                "changed from outside them. Reported for visibility, not auto-reverted."
+            )
+        differences.append({
+            "category": "system_proxy_config", "target": "system_proxy",
+            "baseline": baseline_proxy, "current": live_proxy,
+            "revertible": revertible, "note": note,
+        })
+
+    if SYSTEM == "Linux":
+        live_power, _ = a1.get_wifi_power_management()
+        baseline_power = baseline.get("wifi_power_save")
+        if baseline_power in ("on", "off") and live_power in ("on", "off") and baseline_power != live_power:
+            differences.append({
+                "category": "wifi_power_management", "target": "wifi",
+                "baseline": baseline_power, "current": live_power, "revertible": True, "note": None,
+            })
+
     return differences, scan
 
 
@@ -919,6 +1712,23 @@ def rollback(scan_id=None, dry_run=False, cache_db=None, cache_key=None):
             )
         elif category == "wifi_radio":
             ok, message = _set_wifi_radio_software_state(baseline == "on")
+        elif category == "hosts_file_entries":
+            ok, message = _set_hosts_file_entries([diff["current"]])
+        elif category == "system_proxy_config":
+            if SYSTEM == "Windows":
+                ok, message = _set_system_proxy_config(
+                    bool(baseline.get("proxy_enabled")), server=baseline.get("proxy_server"),
+                )
+            elif SYSTEM == "Darwin":
+                enabled = any(str(baseline.get(k)) == "1" for k in ("HTTPEnable", "HTTPSEnable"))
+                ok, message = _set_system_proxy_config(enabled, service=conn)
+            else:
+                # Linux never reaches here -- diff_against_scan() marks this
+                # category non-revertible on Linux, so the "if not
+                # diff['revertible']" check above already skipped it.
+                ok, message = False, f"No revert handler for category {category!r} on {SYSTEM}"
+        elif category == "wifi_power_management":
+            ok, message = _set_wifi_power_management(baseline == "on")
         else:
             ok, message = False, f"No revert handler for category {category!r}"
 
@@ -1102,6 +1912,10 @@ def main():
                          help="Check gateway/internet reachability; roll back against the baseline scan automatically if unreachable")
     parser.add_argument("--fix-firewall-finding", metavar="FINDING_ID",
                          help="Disable the exact Windows Firewall rule this A2 finding identified as the cause")
+    parser.add_argument("--flush-dns-cache", action="store_true",
+                         help="Flush the OS's DNS resolver cache (one-shot action, logged to A6)")
+    parser.add_argument("--sync-clock", action="store_true",
+                         help="Force an immediate system clock resync (one-shot action, logged to A6)")
     parser.add_argument("--list-events", action="store_true", help="List past rollback events")
     parser.add_argument("--cache-db", default=None, help="A6 database path (default: A6's own default)")
     parser.add_argument("--cache-key", default=None, help="A6 key file path (default: A6's own default)")
@@ -1143,6 +1957,20 @@ def main():
             ok, message = fix_firewall_finding(
                 args.fix_firewall_finding, cache_db=args.cache_db, cache_key=args.cache_key,
             )
+            print(message)
+            if not ok:
+                return 1
+
+        if args.flush_dns_cache:
+            did_something = True
+            ok, message = run_flush_dns_cache(cache_db=args.cache_db, cache_key=args.cache_key)
+            print(message)
+            if not ok:
+                return 1
+
+        if args.sync_clock:
+            did_something = True
+            ok, message = run_sync_system_clock(cache_db=args.cache_db, cache_key=args.cache_key)
             print(message)
             if not ok:
                 return 1
