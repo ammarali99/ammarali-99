@@ -314,8 +314,8 @@ actually used — see below). Current version does:
   -- weaker than this codebase's usual real-hardware bar, flagged as
   such rather than overstated.
 
-**A2 (Rule Engine) is started (v0.7.2).** Standard-library-only Python,
-in its own file (`a2_rule_engine_v0.7.2.py`), deliberately never importing
+**A2 (Rule Engine) is started (v0.8.0).** Standard-library-only Python,
+in its own file (`a2_rule_engine_v0.8.0.py`), deliberately never importing
 A1's file directly -- it reads the same dict A1's `--json` export produces
 (file-based handoff: A1 writes `--json scan.json`, A2 reads `--input
 scan.json`), so A1 can keep bumping its own version/filename with zero
@@ -333,7 +333,7 @@ changes needed in A2. Current version does:
 - `evaluate()`: runs every registered rule against A1's discovery dict,
   wrapping each one individually so one rule raising an exception doesn't
   take down the rest (same defensive pattern as A1's own scan steps)
-- Rule set (12 rules): Wi-Fi radio off (hardware/software), adapter
+- Rule set (13 rules): Wi-Fi radio off (hardware/software), adapter
   disabled, adapter enabled-but-not-connected, no gateway found, gateway
   unreachable/high packet loss/high latency, internet unreachable (with a
   WAN-vs-LAN distinction based on whether the gateway itself is reachable),
@@ -341,14 +341,45 @@ changes needed in A2. Current version does:
   through from A1's `_upnp_sanity_notes()` rather than re-parsed here, to
   avoid a second, fragile copy of that detection logic), insecure Telnet
   port open, Wi-Fi channel congestion recommendation, DNS not configured,
-  DNS configured but not resolving (v0.3.0, see below), a local firewall
-  rule blocking DNS/ICMP (v0.4.0, see below)
+  a specific interface set to static with no DNS configured (v0.8.0, see
+  below), DNS configured but not resolving (v0.3.0, see below), a local
+  firewall rule blocking DNS/ICMP (v0.4.0, see below)
 - CLI: prints findings sorted by severity with a summary count, `--json`
   export in the same shape A6 will eventually store directly
 - `--cache` (v0.7.0): skips `--input` entirely, reads the most recent scan
   straight out of A6 (or a specific one via `--cache-scan-id`), evaluates
   it unchanged, and writes findings back into A6 via `write_findings()`.
   Same dynamic `_import_a6()` loader A1 v0.13.0 uses, for the same reason
+- **New rule (v0.8.0): a specific interface set to static with no DNS
+  configured.** Ammar's question after A1 v0.14.0 added
+  `get_interface_network_config()`: does A2 need updating every time A1
+  gains a new discovery function, since A2's whole job is to evaluate
+  A1's output? Checked, and the answer here was yes -- nothing in the
+  existing rule set read `interface_network_config` at all.
+  `check_dns_missing()` only ever read the old flat, whole-machine
+  `dns_servers` field, which can say "DNS isn't configured anywhere" but
+  never "DNS isn't configured on *this* interface" -- and A4 v0.3.0's
+  `_set_interface_dns()` fix acts per-interface, so it needs to know
+  which one. `check_interface_dns_missing()` fills that gap, but
+  deliberately only for interfaces in **static** IP mode: DHCP-mode
+  interfaces are skipped on purpose, since on macOS
+  `networksetup -getdnsservers` only shows manually-set DNS overrides,
+  never DHCP-provided ones (an already-flagged A1 limitation) -- an
+  empty reading there means the tool can't see the DNS servers, not that
+  they're missing. Static-mode interfaces have no such ambiguity on any
+  platform. Also considered a matching rule for `interfaces[].mtu`
+  (also never read by any rule) and deliberately didn't add one -- no
+  safe heuristic exists for "wrong" MTU (VPNs and jumbo-frame setups
+  legitimately use non-1500 values), and guessing wrong risks exactly
+  the kind of confidently-wrong finding this codebase keeps catching and
+  fixing elsewhere. Tested with synthetic data covering static+missing
+  (fires), DHCP+missing (correctly doesn't fire), and down-interface
+  (correctly doesn't fire); re-ran against this session's real A1 output
+  as a regression check with no change in the existing 12 rules' output
+  -- this sandbox's `interface_network_config` comes back empty (the
+  same NetworkManager-non-cooperation limitation A1 v0.14.0 already
+  flagged), so the new rule itself is only verified against synthetic
+  data so far, not a live scan that actually triggers it.
 - **Real bug (v0.7.2 fix):** the same class of bug as A1 v0.13.1, found in
   the same debugging session. `a6 = _import_a6()` and `cache.get_scans()`
   both sat outside real exception handling -- either one could raise
@@ -607,6 +638,19 @@ manual flow is gone, replaced by:
 Ammar's explicit request** ("do all fixes on windows... i want all the
 mentioned things to be done"), after he was walked through the real
 feasibility/risk tradeoffs for each:
+
+**Flagged after the fact: the new `_set_interface_mtu()` /
+`_set_interface_dns()` / `_set_interface_ip_mode()` functions, and the
+Linux `rfkill` branch of `_set_wifi_radio_software_state()`, were built
+for all 3 platforms even though "do all fixes on windows" only asked for
+Windows.** Cross-platform support was added to match A1's existing
+convention rather than because it was requested. Ammar caught this and
+was asked directly: keep it, or strip it back to Windows-only. His call:
+**keep it** -- no extra dependencies, matches how A1 already covers all 3
+OSes everywhere else, and the Linux/macOS paths were already tested via
+command-construction mocking (see below). Noted here since building past
+what was actually asked is exactly the kind of thing that should be
+flagged, not quietly left in.
 
 - `interface_admin_state` / `interface_mtu` -- unchanged mechanism from
   v0.1.0, now driven by the diff engine.

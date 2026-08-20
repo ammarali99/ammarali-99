@@ -3,8 +3,52 @@
 a2_rule_engine.py -- Module A2 (Rule Engine) of the offline network
 diagnostic app.
 
-VERSION: 0.7.2
+VERSION: 0.8.0
 CHANGELOG:
+  0.8.0 - New rule: check_interface_dns_missing(). A1 v0.14.0 added
+          get_interface_network_config() (per-interface DNS servers,
+          static/DHCP mode, IP/subnet/gateway, connection name) -- Ammar's
+          question, prompted by that addition: does A2 need updating every
+          time A1 gains a new discovery function, since A2's whole job is
+          to evaluate A1's output? Checked, and the answer here was yes:
+          nothing in the existing 12-rule set read
+          interface_network_config at all. check_dns_missing() still only
+          reads the old flat, whole-machine dns_servers field
+          (get_dns_servers()) -- a coarser reading that can say "DNS isn't
+          configured anywhere" but never "DNS isn't configured on *this*
+          interface," which matters because A4 v0.3.0's
+          _set_interface_dns() fix acts per-interface and needs to know
+          which one.
+
+          check_interface_dns_missing() is deliberately scoped to
+          static-mode interfaces only. DHCP-mode interfaces are skipped on
+          purpose: on macOS, networksetup -getdnsservers only shows
+          manually-set DNS overrides, never DHCP-provided ones (a real,
+          already-flagged A1 limitation) -- an empty reading there doesn't
+          mean DNS is actually missing, it means the tool can't see it.
+          Static-mode interfaces have no such ambiguity on any platform,
+          since DNS is never auto-provided for a static config. Also only
+          checks interfaces that are actually up (admin_enabled and
+          connected both True), same criterion check_interfaces() already
+          uses.
+
+          Considered a matching rule for interfaces[].mtu (also unread by
+          any existing rule) and deliberately did not add one -- there's
+          no safe heuristic for "wrong" MTU (VPNs, jumbo frames, and other
+          legitimate setups use non-1500 values), and guessing wrong here
+          risks exactly the kind of confidently-wrong finding this
+          codebase has caught and fixed elsewhere (A2 v0.2.0's severity-
+          scaling fix, A1's UPnP sanity notes). fix_classification is left
+          at the existing default (FIX_GUIDED) for this new rule -- not
+          touching the fact that A2 never actually uses FIX_AUTO anywhere
+          today, which is a separate, unresolved question from this one.
+
+          Tested with synthetic data: a static-mode, up interface with no
+          DNS servers fires; a DHCP-mode, up interface with no DNS servers
+          does not (guards the macOS blind spot); a down/disabled
+          interface does not. Re-ran against this session's real A1
+          output as a regression check -- existing 12 rules unaffected.
+
   0.7.2 - Same class of bug as A1 v0.13.1, found in the same debugging
           session: `a6 = _import_a6()` and `cache.get_scans(...)` both
           sat outside real exception handling. _import_a6() can raise
@@ -228,8 +272,8 @@ CHANGELOG:
 Standard-library only. No pip installs, same reason as A1 -- see CLAUDE.md.
 
 Run it against a saved scan:
-    python3 network_discovery_v0.13.1.py --json scan.json
-    python3 a2_rule_engine_v0.7.2.py --input scan.json
+    python3 network_discovery_v0.14.0.py --json scan.json
+    python3 a2_rule_engine_v0.8.0.py --input scan.json
 
 Note: this has to be a two-step, file-based handoff, not a direct pipe.
 A1's `--json` with no path still prints its normal plain-language output
@@ -238,11 +282,11 @@ A2 hands it a mix of prose and JSON, not valid JSON on its own. Always
 give A1 a real path (`--json scan.json`) when the output is meant for A2.
 
 Dump findings as JSON instead of/alongside the plain-language printout:
-    python3 a2_rule_engine_v0.7.2.py --input scan.json --json findings.json
+    python3 a2_rule_engine_v0.8.0.py --input scan.json --json findings.json
 
 Or skip the JSON file entirely and read/write straight through A6:
-    python3 network_discovery_v0.13.1.py --cache
-    python3 a2_rule_engine_v0.7.2.py --cache
+    python3 network_discovery_v0.14.0.py --cache
+    python3 a2_rule_engine_v0.8.0.py --cache
 """
 
 import argparse
@@ -592,6 +636,47 @@ def check_dns_missing(data):
     return []
 
 
+def check_interface_dns_missing(data):
+    """
+    Per-interface version of check_dns_missing(), using A1 v0.14.0's
+    interface_network_config (not the old flat dns_servers) so the finding
+    can name which interface needs fixing -- A4's _set_interface_dns() acts
+    per-interface and needs that target.
+
+    Only fires for interfaces in static IP mode. DHCP-mode interfaces are
+    deliberately skipped: on macOS, networksetup -getdnsservers only shows
+    manually-set DNS overrides, never DHCP-provided ones (a real, flagged
+    A1 limitation) -- an empty reading there doesn't mean DNS is actually
+    missing, it means the tool can't see it. Static-mode interfaces don't
+    have that ambiguity anywhere: DNS is never auto-provided for a static
+    config, so an empty list is unambiguous evidence on all 3 platforms.
+
+    Only checks interfaces that are actually up (admin_enabled and
+    connected both True) -- same "up interface" criteria check_interfaces()
+    already uses, since a down interface's DNS config isn't relevant to
+    anything right now.
+    """
+    findings = []
+    net_config = data.get("interface_network_config") or {}
+    by_name = {i.get("name"): i for i in (data.get("interfaces") or [])}
+    for name, cfg in net_config.items():
+        iface = by_name.get(name) or {}
+        if iface.get("admin_enabled") is not True or iface.get("connected") is not True:
+            continue
+        if cfg.get("ip_assignment_mode") != "static":
+            continue
+        if cfg.get("dns_servers"):
+            continue
+        findings.append(make_finding(
+            rule_id="interface_dns_missing", category="dhcp", severity=SEV_WARNING,
+            target=name,
+            summary=f"Network adapter '{name}' is set to a static IP but has no DNS server configured.",
+            detail=str(cfg), fix_classification=FIX_GUIDED,
+            evidence={"interface_network_config": cfg, "interface": iface},
+        ))
+    return findings
+
+
 def check_dns_not_resolving(data):
     """
     Flags "internet is reachable but no configured DNS server actually
@@ -731,6 +816,7 @@ RULES = [
     check_insecure_ports,
     check_wifi_channel_recommendation,
     check_dns_missing,
+    check_interface_dns_missing,
     check_dns_not_resolving,
     check_firewall_blocking,
 ]
