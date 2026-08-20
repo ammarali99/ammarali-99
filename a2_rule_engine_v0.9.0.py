@@ -3,8 +3,279 @@
 a2_rule_engine.py -- Module A2 (Rule Engine) of the offline network
 diagnostic app.
 
-VERSION: 0.8.0
+VERSION: 0.9.0
 CHANGELOG:
+  0.9.0 - Fourteen new rules plus one deliberate change to an existing
+          rule, wiring A2 up to the ~21 new fields A1 v0.15.0 added to
+          its discovery dict. Per v0.8.0's own precedent (an MTU rule
+          was considered and declined for lack of a safe non-guessing
+          trigger), not every new A1 field got a rule here -- the ones
+          below are the ones judged to have a safe trigger condition; a
+          longer list of fields deliberately left evidence-only is at
+          the bottom of this entry.
+
+          New rules:
+
+          check_rogue_dhcp() -- fires when A1's detect_rogue_dhcp_servers()
+          (needs root to bind UDP port 68, so this only ever fires when
+          A1 was actually run with enough privilege) found more than one
+          distinct DHCP server answering. category="dhcp",
+          severity=critical, target="network" (a network-wide fact, not
+          tied to one interface), fix_classification=FIX_GUIDED -- a
+          second DHCP server needs a human to find and unplug/reconfigure
+          it, not something this app can safely act on itself.
+
+          check_duplicate_ip() -- one finding per conflicting IP in A1's
+          best-effort duplicate_ip.conflicts (a MAC-address change on the
+          same IP between two ARP reads a few seconds apart -- A1's own
+          docstring is explicit this is best-effort, not a guarantee, and
+          this rule doesn't claim otherwise). target is the conflicting
+          IP itself (the stable identity here, not either MAC, since the
+          IP is what a later scan would re-detect against).
+          category="lan", severity=warning (not critical -- A1's own
+          detection window is narrow enough that this needs a human to
+          confirm, not urgent enough to alarm over), FIX_GUIDED.
+
+          check_multiple_default_routes() -- fires when more than one
+          family="ipv4" route in routing_table matches a default-route
+          destination (Linux "default", Windows "0.0.0.0", per the
+          confirmed field shapes). severity=warning, not critical --
+          routing table edits are too risky for this app to guide a
+          non-technical customer through blind, so
+          fix_classification=FIX_NONE; this is a real, surfaceable fact
+          ("something on this machine set up two default routes"), not
+          something A3 should ever attempt.
+
+          check_hosts_file_hijack() -- deliberately narrow, and the
+          docstring on the function itself says why at more length: it
+          only checks a hosts-file entry against a small fixed watchlist
+          of hostnames this app's own checks already depend on
+          (example.com -- A1's _DNS_TEST_HOSTNAME, confirmed by reading
+          the real file rather than assumed; connectivitycheck.gstatic.com
+          -- the captive-portal check's host; speed.cloudflare.com -- the
+          throughput check's host), fires only when the entry is active
+          (not commented out) and its redirect target is a real,
+          non-loopback IP. Loopback/0.0.0.0 targets are excluded on
+          purpose -- that's the standard, legitimate shape of a
+          customer's own ad-blocking hosts file, not hijacking, and this
+          app has no internet-connected reputation service to tell a
+          real hijack from a legitimate block list beyond that one
+          heuristic. A broader "any suspicious hosts entry" rule was
+          considered and rejected for the same reason v0.8.0 rejected a
+          guessing MTU rule: no safe way to draw that line offline.
+          category="security", severity=critical (a real redirect of one
+          of this app's own trusted checks is a serious, concrete
+          finding, not a maybe), target=the hijacked hostname,
+          FIX_GUIDED.
+
+          check_proxy_configured() -- fires when A1's
+          system_proxy_config indicates an active proxy. Windows:
+          proxy_enabled is True. Linux: http_proxy or https_proxy is
+          truthy. macOS: NOT detected -- see "Judgment call" below.
+          Severity scales via _connectivity_context(), same pattern as
+          check_wifi_radio_off(): info when the internet is confirmed
+          working or the check was skipped (an active proxy alone isn't
+          inherently a problem -- lots of legitimate reasons to run one),
+          warning when the internet is confirmed down (a broken/stale
+          proxy config is a plausible cause worth surfacing more
+          clearly). category="lan", target="system_proxy", FIX_GUIDED.
+
+          check_vpn_active() -- fires when A1's vpn_interfaces is
+          non-empty. Same connectivity-context severity scaling as the
+          proxy rule, same reasoning (a VPN being up isn't itself a
+          problem). fix_classification=FIX_NONE -- this app has no
+          business touching VPN configuration, full stop.
+          category="lan", target="vpn".
+
+          check_pmtu_blackhole_finding() -- fires when A1's
+          pmtu_check.blackhole_suspected is True. category="wan",
+          severity=warning, target="pmtu", FIX_GUIDED, and the summary
+          explicitly suggests lowering the interface's MTU as the
+          workaround -- this routes straight to A4's existing
+          _set_interface_mtu() fix from v0.3.0, so no new A4 fix
+          category was needed for this one.
+
+          check_captive_portal_finding() -- fires when A1's
+          captive_portal.portal_detected is True. severity=critical
+          (deliberately higher than most guided-fix findings here: a
+          captive portal fully blocks real internet use even though
+          internet.reachable can show True, since A1's TCP-connect
+          reachability test doesn't itself get intercepted the way an
+          HTTP request does -- this is a case where "internet works" and
+          "internet is actually usable" diverge, and a customer stuck
+          behind a login page needs to know clearly). category="wan",
+          target="captive_portal", FIX_GUIDED with a plain-language-only
+          summary ("open a browser, look for a login page") -- there's
+          nothing here for A3 to automate.
+
+          check_wifi_weak_signal() -- fires when wifi_connection has
+          both signal_dbm and noise_dbm and their difference (SNR) is
+          under 15dB. 15dB is a conservative, commonly-cited "poor"
+          signal-to-noise boundary in Wi-Fi site-survey guidance (roughly:
+          25dB+ good, 15-25dB workable, under 15dB unreliable) -- picked
+          deliberately conservative so this doesn't flag a merely
+          mediocre signal as a problem. severity=info (this is physical/
+          positional, advisory only -- nothing to fix in software),
+          fix_classification=FIX_NONE, target=the connected SSID (or
+          "wifi" if unavailable). category="wifi".
+
+          check_wifi_power_saving_enabled() -- the one new rule built on
+          check_firewall_blocking()'s "precompute symptom booleans, then
+          a targeted dispatch that declines to fire without
+          corroboration" pattern, per the task spec. wifi_power_save ==
+          "on" (Linux-only field, per A1) by itself is normal, common,
+          and not a problem -- this only fires when it's ALSO paired
+          with an actual symptom: gateway_latency.loss_percent >= 20, or
+          jitter_ms > 50. category="wifi", severity=warning,
+          target="wifi_power_save", FIX_GUIDED, and the summary names
+          the actual symptom seen (loss or jitter) so the customer sees
+          the reasoning, not just an assertion.
+
+          check_wps_enabled() -- fires per wifi_networks entry with
+          wps_enabled is True (Linux-only field from A1's `iw scan`
+          parser; absent entirely on Windows/macOS, read via .get() so
+          it degrades to "no finding" there rather than guessing).
+          Scoping judgment call, explained fully on the function itself:
+          scoped to the network matching wifi_connection["ssid"] (the
+          customer's own, currently-connected AP) rather than firing for
+          every nearby scanned network. fix_classification=FIX_NONE --
+          WPS is the router's own setting, and this app has no router
+          credentials to change it (same territory as CLAUDE.md's
+          already-flagged web-UI-scraping decision for consumer
+          routers). category="security", severity=warning,
+          target=the SSID.
+
+          check_clock_not_synced() -- fires when clock_drift.synchronized
+          is explicitly False (never on None -- None means the OS-level
+          check itself couldn't determine sync status, and guessing
+          "not synced" from that would be exactly the confidently-wrong
+          shape this codebase keeps catching). category="lan",
+          severity=warning, target="system_clock".
+          fix_classification=FIX_AUTO -- see "First use of FIX_AUTO"
+          below.
+
+          check_high_jitter() -- fires when gateway_latency.jitter_ms is
+          not None and > 30ms. 30ms clears the same bar v0.8.0's MTU
+          rule was rejected on, but the other direction: it's a
+          genuinely standard, widely-cited "noticeable for real-time
+          traffic" jitter threshold (VoIP/video-call quality guidance
+          consistently puts acceptable jitter well under this), not a
+          customer/context-specific value the way MTU is. severity=info,
+          fix_classification=FIX_NONE -- nothing for this app to act on,
+          purely diagnostic. category="lan", target="gateway_jitter".
+
+          check_throughput_critically_low() -- fires when
+          throughput.mbps is not None and < 1.0. Deliberately a
+          conservative absolute floor -- "basically not working"
+          regardless of what plan the customer is paying for, not a
+          judgment about being "slow" relative to an unknown ISP speed
+          tier this app has no way to know. severity=warning,
+          fix_classification=FIX_NONE (same reasoning: no basis to
+          suggest a fix beyond "your connection is basically not
+          working right now"). category="wan", target="throughput".
+
+          Changed existing rule: check_dns_not_resolving()'s
+          fix_classification changes from FIX_GUIDED to FIX_AUTO. This
+          is a deliberate change to existing behavior, not a new rule,
+          and gets the same explicit reasoning standard v0.8.0's MTU
+          rejection got rather than a silent tweak: A4 v0.4.0 (in
+          progress in parallel with this version) is adding a
+          flush_dns_cache() one-shot action specifically to back this
+          up. A stale/poisoned local DNS cache entry is judged safe and
+          fully reversible to flush -- unlike every FIX_GUIDED rule in
+          this file, which touches interface, firewall, or Wi-Fi-radio
+          state with a real tradeoff a human should at least see before
+          it happens. Only the classification changed; the rule's
+          trigger condition (internet reachable, no configured DNS
+          server resolving) is untouched.
+
+          First use of FIX_AUTO: check_clock_not_synced() and the
+          check_dns_not_resolving() change above are the first two real
+          uses of FIX_AUTO anywhere in this codebase -- flagged
+          explicitly, as instructed, rather than left as a silent
+          first-time default. Both were judged safe/reversible with no
+          real user tradeoff (an NTP resync, a DNS cache flush), unlike
+          every existing FIX_GUIDED rule. A3 (Fix Engine) doesn't exist
+          yet, so today this only labels data -- it doesn't cause
+          anything to actually auto-execute.
+
+          Judgment call: macOS proxy detection. A1's
+          get_system_proxy_config() on macOS just dumps whatever raw
+          key-value pairs `scutil --proxy` prints, with no A1-side
+          normalization the way Windows (proxy_enabled) and Linux
+          (http_proxy/https_proxy) get. Nothing in A1's source confirms
+          an exact key name for "is a proxy on" on macOS (the likely
+          candidate, HTTPEnable, is not something this file's reading of
+          A1 could confirm without a real Mac to check against), so
+          check_proxy_configured() deliberately does not attempt to
+          read it -- treated as insufficient data, not guessed at. A
+          real gap, stated as one: a Mac with a proxy configured will
+          not get this finding until A1 normalizes that field the way it
+          already does for the other two platforms.
+
+          Judgment call: WPS scoping. Scoped to the currently-connected
+          SSID (cross-referenced against wifi_connection.ssid) rather
+          than firing for every nearby wifi_networks entry with
+          wps_enabled. Reasoning: fix_classification is FIX_NONE either
+          way (this app has no router credentials to act on any of
+          them), and flagging a neighbor's router's WPS setting isn't
+          actionable or relevant to this customer -- it would just be
+          noise about hardware they don't own. The real tradeoff, stated
+          honestly: a customer connected via Ethernet (wifi_connection
+          .ssid is None) whose own Wi-Fi AP is still broadcasting WPS
+          won't get this finding today, since there's no connected SSID
+          to cross-reference against. Judged an acceptable gap over the
+          noisier alternative.
+
+          Judgment call: hosts-file known-good hostname list.
+          Deliberately just three hostnames this app's own other checks
+          already rely on and can name with certainty (see
+          check_hosts_file_hijack() above) -- not an attempt at a
+          general "known good sites" list, which would need exactly the
+          kind of internet-connected reputation data this app doesn't
+          have and can't have per CLAUDE.md's offline constraint.
+
+          Considered, not pursued (evidence-only, no rule) -- matching
+          v0.8.0's own precedent of explicitly declining rather than
+          silently skipping: interface_link_info (link speed/duplex --
+          no safe "wrong" threshold without knowing the actual
+          negotiated capability of both ends); dhcp_leases (lease time
+          remaining -- nothing actionable follows from a low value
+          alone); arp_table (no verdict attached to the table's mere
+          existence); upnp_devices / mdns_devices (a broader device
+          inventory, not a fault signal by itself); gateway_traceroute /
+          internet_traceroute (both already visible as raw evidence, no
+          safe automated verdict about which hop is "the problem");
+          per-DNS-server latency (already covered by the existing
+          dns_resolution-driven rules, nothing new needed);  dns_cache
+          (a cache dump, not a fault); dns_suffix_search_list (no safe
+          "wrong" heuristic); wifi_connection.radio_type (802.11
+          standard/band by itself isn't a problem, used only as evidence
+          inside other findings if ever needed); ipv6_status (too many
+          non-guessable dual-stack misconfiguration shapes -- direct
+          parallel to v0.8.0's MTU rejection); nat_type (Symmetric NAT
+          is sometimes fine, sometimes not, entirely context-dependent,
+          no safe verdict); driver_info (no safe "outdated" threshold
+          without an internet-connected version database this app
+          doesn't have).
+
+          Explicitly out of scope for this batch, not built: a
+          gateway-MAC-stability-across-scans (ARP-spoofing-style)
+          rule -- it would need cross-scan history, and evaluate(data)
+          only ever sees one scan's dict with no previous_scan
+          parameter. evaluate()'s signature is untouched. Tracked
+          separately, not forgotten.
+
+          Tested with synthetic fixtures per new rule (a triggering case
+          and a non-triggering case for each of the rules with real
+          logic -- the threshold rules, the correlation rule, and the
+          narrow hijack rule got the most scrutiny, per the task's own
+          priority) -- see this version's test run for exactly which
+          fired against real A1 v0.15.0 output in this sandbox versus
+          only synthetic data. Re-ran the full rule set against this
+          session's real A1 output as a regression check: all 13
+          pre-existing rules produced unchanged output.
+
   0.8.0 - New rule: check_interface_dns_missing(). A1 v0.14.0 added
           get_interface_network_config() (per-interface DNS servers,
           static/DHCP mode, IP/subnet/gateway, connection name) -- Ammar's
@@ -272,8 +543,8 @@ CHANGELOG:
 Standard-library only. No pip installs, same reason as A1 -- see CLAUDE.md.
 
 Run it against a saved scan:
-    python3 network_discovery_v0.14.0.py --json scan.json
-    python3 a2_rule_engine_v0.8.0.py --input scan.json
+    python3 network_discovery_v0.15.0.py --json scan.json
+    python3 a2_rule_engine_v0.9.0.py --input scan.json
 
 Note: this has to be a two-step, file-based handoff, not a direct pipe.
 A1's `--json` with no path still prints its normal plain-language output
@@ -282,15 +553,16 @@ A2 hands it a mix of prose and JSON, not valid JSON on its own. Always
 give A1 a real path (`--json scan.json`) when the output is meant for A2.
 
 Dump findings as JSON instead of/alongside the plain-language printout:
-    python3 a2_rule_engine_v0.8.0.py --input scan.json --json findings.json
+    python3 a2_rule_engine_v0.9.0.py --input scan.json --json findings.json
 
 Or skip the JSON file entirely and read/write straight through A6:
-    python3 network_discovery_v0.14.0.py --cache
-    python3 a2_rule_engine_v0.8.0.py --cache
+    python3 network_discovery_v0.15.0.py --cache
+    python3 a2_rule_engine_v0.9.0.py --cache
 """
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import sys
@@ -687,6 +959,12 @@ def check_dns_not_resolving(data):
     into check_internet_reachability(). Only fires when A1's
     dns_resolution check actually ran -- any_working is None (not False)
     when it was skipped (--no-internet) or there were no servers to test.
+
+    fix_classification is FIX_AUTO as of v0.9.0 (was FIX_GUIDED) -- see
+    that version's changelog entry for the reasoning (A4 v0.4.0's
+    flush_dns_cache() backs this up; a cache flush is judged safe and
+    reversible, unlike this file's other guided fixes). The trigger
+    condition itself is unchanged from v0.3.0.
     """
     internet = data.get("internet") or {}
     dns_res = data.get("dns_resolution") or {}
@@ -698,8 +976,482 @@ def check_dns_not_resolving(data):
             target="dns",
             summary=(f"Internet is working, but DNS isn't resolving names ({servers}) "
                      "-- try switching to a different DNS server."),
-            detail=str(dns_res), fix_classification=FIX_GUIDED,
+            detail=str(dns_res), fix_classification=FIX_AUTO,
             evidence={"dns_resolution": dns_res, "internet": internet},
+        )]
+    return []
+
+
+# ---------------------------------------------------------------------
+# v0.9.0 rules -- wired up to the ~21 new A1 v0.15.0 discovery fields.
+# See this version's CHANGELOG entry above for the full per-rule
+# reasoning; each docstring below covers just what's specific to that
+# rule.
+# ---------------------------------------------------------------------
+
+def check_rogue_dhcp(data):
+    """
+    Fires when A1's detect_rogue_dhcp_servers() (needs root to bind UDP
+    port 68) saw more than one distinct DHCP server answer a broadcast
+    DHCPDISCOVER -- a second/unexpected DHCP server on the LAN, a classic
+    hard-to-diagnose fault (a misconfigured switch bridging two networks,
+    a consumer router plugged in downstream with its own DHCP still on,
+    or genuine rogue DHCP). target="network" -- this is a network-wide
+    fact, not attributable to one interface.
+    """
+    rogue = data.get("rogue_dhcp_servers") or {}
+    count = rogue.get("count", 0)
+    if count is not None and count > 1:
+        servers = ", ".join(rogue.get("responding_servers") or []) or "unknown addresses"
+        return [make_finding(
+            rule_id="rogue_dhcp_servers", category="dhcp", severity=SEV_CRITICAL,
+            target="network",
+            summary=(f"More than one device on your network is trying to hand out IP addresses "
+                     f"({count} DHCP servers responded: {servers}) -- this usually means a second "
+                     "router or a misconfigured device is plugged in, and can cause random, "
+                     "intermittent connection problems."),
+            detail=str(rogue), fix_classification=FIX_GUIDED,
+            evidence={"rogue_dhcp_servers": rogue},
+        )]
+    return []
+
+
+def check_duplicate_ip(data):
+    """
+    One finding per conflicting IP in A1's best-effort duplicate_ip.
+    conflicts (a MAC address change on the same IP between two ARP-table
+    reads a few seconds apart -- A1's own docstring is explicit this is
+    best-effort, not a guarantee, and this rule doesn't overstate it
+    either). target is the conflicting IP itself, since that's the
+    stable identity a later scan would re-detect against -- neither MAC
+    alone identifies "the same problem" the way the IP does here.
+    """
+    findings = []
+    dup = data.get("duplicate_ip") or {}
+    for conflict in dup.get("conflicts") or []:
+        ip = conflict.get("ip", "unknown")
+        findings.append(make_finding(
+            rule_id="duplicate_ip", category="lan", severity=SEV_WARNING,
+            target=ip,
+            summary=(f"{ip} appears to have been used by more than one device on your network "
+                     "recently -- this can cause one or both devices to drop off the network "
+                     "intermittently."),
+            detail=str(conflict), fix_classification=FIX_GUIDED,
+            evidence={"conflict": conflict, "note": dup.get("note")},
+        ))
+    return findings
+
+
+def check_multiple_default_routes(data):
+    """
+    Fires when more than one family="ipv4" route in A1's routing_table
+    matches a default-route destination (Linux/macOS "default", Windows
+    "0.0.0.0" -- see the confirmed field shapes this version was built
+    against). severity is warning, not critical, and
+    fix_classification is FIX_NONE: editing a routing table blind is too
+    risky for this app to guide a non-technical customer through, but
+    "something set up two default routes" is still a real, worth-
+    surfacing fact.
+    """
+    routes = data.get("routing_table") or []
+    defaults = [
+        r for r in routes
+        if r.get("family") == "ipv4" and r.get("destination") in ("default", "0.0.0.0", "0.0.0.0/0")
+    ]
+    if len(defaults) > 1:
+        return [make_finding(
+            rule_id="multiple_default_routes", category="lan", severity=SEV_WARNING,
+            target="network",
+            summary=(f"This machine has {len(defaults)} default routes configured at once -- "
+                     "usually caused by more than one active network connection (e.g. Wi-Fi and "
+                     "Ethernet both configured with a gateway), which can cause unpredictable "
+                     "routing."),
+            detail=str(defaults), fix_classification=FIX_NONE,
+            evidence={"routing_table": defaults},
+        )]
+    return []
+
+
+# Hostnames this app's own other checks already depend on and can name
+# with certainty -- see check_hosts_file_hijack() below for why the
+# watchlist is kept this narrow rather than a general "known good
+# sites" list.
+_HOSTS_HIJACK_WATCHLIST = {
+    "example.com",                     # A1's _DNS_TEST_HOSTNAME, confirmed by reading A1's source
+    "connectivitycheck.gstatic.com",   # A1's captive-portal check host
+    "speed.cloudflare.com",            # A1's throughput check host
+}
+
+
+def _is_loopback_or_unspecified(ip_str):
+    """True for 127.0.0.1/::1 (loopback) or 0.0.0.0/:: (unspecified) --
+    both are the common, legitimate shape of a customer's own ad-block
+    hosts file entry, not a hijack redirect."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_unspecified
+
+
+def check_hosts_file_hijack(data):
+    """
+    Deliberately narrow, on purpose: this does NOT flag "any suspicious
+    hosts entry." It only checks active (not commented-out) hosts-file
+    entries against a small, fixed watchlist of hostnames this app's own
+    other checks already depend on and can name with certainty (see
+    _HOSTS_HIJACK_WATCHLIST) -- example.com (A1's DNS-resolution test
+    hostname), connectivitycheck.gstatic.com (the captive-portal check's
+    host), and speed.cloudflare.com (the throughput check's host).
+
+    A matching entry only fires if its redirect target is a real,
+    non-loopback, non-unspecified IP. 127.0.0.1/0.0.0.0/::1/:: targets
+    are excluded on purpose -- that's the standard, legitimate shape of
+    a customer's own ad-blocking hosts file (or a leftover from a
+    previous fix), not hijacking, and this app has no internet-connected
+    reputation service to distinguish a real hijack from a legitimate
+    block list any more precisely than that. A broader "any suspicious
+    hosts entry" rule was considered and declined for the same reason
+    v0.8.0 declined a guessing MTU rule: there's no safe way to draw
+    that line without a connectivity-dependent lookup this offline app
+    doesn't have.
+    """
+    findings = []
+    for entry in data.get("hosts_file") or []:
+        if entry.get("active") is not True:
+            continue
+        ip = entry.get("ip")
+        if not ip or _is_loopback_or_unspecified(ip):
+            continue
+        for hostname in entry.get("hostnames") or []:
+            if hostname not in _HOSTS_HIJACK_WATCHLIST:
+                continue
+            findings.append(make_finding(
+                rule_id="hosts_file_hijack", category="security", severity=SEV_CRITICAL,
+                target=hostname,
+                summary=(f"Your computer's hosts file redirects '{hostname}' (a site this app "
+                         f"uses to test your connection) to {ip} instead of its real address -- "
+                         "this can be a sign of malware or a hijacked network configuration."),
+                detail=str(entry), fix_classification=FIX_GUIDED,
+                evidence={"hosts_file_entry": entry},
+            ))
+    return findings
+
+
+def _proxy_active(data):
+    """
+    Returns True/False when A1's system_proxy_config confidently tells
+    us whether a proxy is active, or None when it doesn't. Windows:
+    proxy_enabled is a real, A1-normalized bool. Linux: http_proxy or
+    https_proxy being set is a real, normalized signal. macOS: A1
+    doesn't normalize scutil --proxy's raw key-value dump at all, and
+    nothing in A1's source confirms an exact key name for "is a proxy
+    on" there (the likely candidate, HTTPEnable, isn't something this
+    file's reading of A1 could confirm without real Mac hardware to
+    check against) -- so macOS is deliberately treated as insufficient
+    data rather than guessed at, returning None. A real, stated gap: a
+    Mac with an active proxy won't get this finding until A1 normalizes
+    that field the way it already does for Windows and Linux.
+    """
+    proxy = data.get("system_proxy_config") or {}
+    if not proxy:
+        return None
+    if "proxy_enabled" in proxy:
+        return proxy.get("proxy_enabled") is True
+    if "http_proxy" in proxy or "https_proxy" in proxy:
+        return bool(proxy.get("http_proxy")) or bool(proxy.get("https_proxy"))
+    return None
+
+
+def check_proxy_configured(data):
+    """
+    Fires when _proxy_active() confidently detects an active system
+    proxy (Windows/Linux only -- see _proxy_active()'s docstring for why
+    macOS isn't attempted). Severity scales with _connectivity_context(),
+    same pattern as check_wifi_radio_off(): a configured proxy isn't
+    inherently a problem (plenty of legitimate reasons to run one), so
+    it's info when the internet works fine or the check was skipped --
+    unlike the interface/radio rules, "unknown" is deliberately treated
+    the same as "ok" here, not left at a louder default, because an
+    active proxy alone was never alarming in the first place. It's
+    upgraded to warning only when the internet is confirmed down, where
+    a broken or stale proxy config is a plausible contributing cause
+    worth surfacing more clearly.
+    """
+    if _proxy_active(data) is not True:
+        return []
+    context = _connectivity_context(data)
+    severity = SEV_WARNING if context == "broken" else SEV_INFO
+    proxy = data.get("system_proxy_config") or {}
+    return [make_finding(
+        rule_id="proxy_configured", category="lan", severity=severity,
+        target="system_proxy",
+        summary=("A system-wide proxy is configured on this machine." +
+                  (" Your internet isn't working right now -- if this proxy is stale or "
+                   "misconfigured, that could be why." if context == "broken" else "")),
+        detail=str(proxy), fix_classification=FIX_GUIDED,
+        evidence={"system_proxy_config": proxy, "internet": data.get("internet")},
+    )]
+
+
+def check_vpn_active(data):
+    """
+    Fires when A1's vpn_interfaces (name-pattern matched against
+    get_interface_status()'s output) is non-empty. Same
+    _connectivity_context() severity scaling as check_proxy_configured(),
+    same reasoning -- a VPN being up isn't itself a problem.
+    fix_classification is FIX_NONE: this app has no business touching
+    VPN configuration under any circumstance.
+    """
+    vpns = data.get("vpn_interfaces") or []
+    if not vpns:
+        return []
+    context = _connectivity_context(data)
+    severity = SEV_WARNING if context == "broken" else SEV_INFO
+    names = ", ".join(v.get("name", "unknown") for v in vpns)
+    return [make_finding(
+        rule_id="vpn_active", category="lan", severity=severity,
+        target="vpn",
+        summary=(f"A VPN/tunnel interface is active ({names})." +
+                  (" Your internet isn't working right now -- if the VPN is stuck or "
+                   "misconfigured, that could be why." if context == "broken" else "")),
+        detail=str(vpns), fix_classification=FIX_NONE,
+        evidence={"vpn_interfaces": vpns, "internet": data.get("internet")},
+    )]
+
+
+def check_pmtu_blackhole_finding(data):
+    """
+    Fires when A1's pmtu_check.blackhole_suspected is True. Summary
+    explicitly suggests lowering the interface's MTU as a workaround --
+    this routes straight to A4's existing _set_interface_mtu() fix from
+    v0.3.0, so no new A4 fix category is needed for this rule.
+    """
+    pmtu = data.get("pmtu_check") or {}
+    if pmtu.get("blackhole_suspected") is True:
+        return [make_finding(
+            rule_id="pmtu_blackhole", category="wan", severity=SEV_WARNING,
+            target="pmtu",
+            summary=("A network path problem (a 'PMTU blackhole') may be silently dropping some "
+                     "of your traffic -- lowering this connection's MTU is usually the workaround."),
+            detail=str(pmtu), fix_classification=FIX_GUIDED,
+            evidence={"pmtu_check": pmtu},
+        )]
+    return []
+
+
+def check_captive_portal_finding(data):
+    """
+    Fires when A1's captive_portal.portal_detected is True. Severity is
+    critical, deliberately higher than most FIX_GUIDED findings in this
+    file: a captive portal fully blocks real internet use even though
+    internet.reachable can still show True (A1's TCP-connect
+    reachability test isn't itself interceptable the way an HTTP request
+    is) -- "internet works" and "internet is actually usable" diverge
+    here, and a customer stuck behind a login page needs a clear signal,
+    not an info note. Summary is plain-language guidance only; there's
+    nothing here for A3 to automate.
+    """
+    portal = data.get("captive_portal") or {}
+    if portal.get("portal_detected") is True:
+        return [make_finding(
+            rule_id="captive_portal", category="wan", severity=SEV_CRITICAL,
+            target="captive_portal",
+            summary=("This network is showing a login/sign-in page before it will let you "
+                     "online -- open a web browser and look for a login page (common on hotel, "
+                     "cafe, and guest Wi-Fi networks)."),
+            detail=str(portal), fix_classification=FIX_GUIDED,
+            evidence={"captive_portal": portal},
+        )]
+    return []
+
+
+def check_wifi_weak_signal(data):
+    """
+    Fires when wifi_connection has both signal_dbm and noise_dbm and
+    their difference (signal-to-noise ratio) is under 15dB. 15dB is a
+    conservative, commonly-cited "poor" SNR boundary in Wi-Fi
+    site-survey guidance (roughly: 25dB+ good, 15-25dB workable, under
+    15dB unreliable) -- picked deliberately conservative so this doesn't
+    flag a merely mediocre signal as a problem. Purely physical/
+    positional and advisory -- nothing in software to fix, hence
+    severity=info and fix_classification=FIX_NONE.
+    """
+    wifi = data.get("wifi_connection") or {}
+    signal = wifi.get("signal_dbm")
+    noise = wifi.get("noise_dbm")
+    if signal is not None and noise is not None:
+        snr = signal - noise
+        if snr < 15:
+            target = wifi.get("ssid") or "wifi"
+            return [make_finding(
+                rule_id="wifi_weak_signal", category="wifi", severity=SEV_INFO,
+                target=target,
+                summary=(f"Wi-Fi signal quality is poor ({signal}dBm signal vs {noise}dBm noise, "
+                         f"a {snr}dB signal-to-noise ratio) -- try moving closer to the router or "
+                         "reducing interference."),
+                detail=str(wifi), fix_classification=FIX_NONE,
+                evidence={"wifi_connection": wifi},
+            )]
+    return []
+
+
+def check_wifi_power_saving_enabled(data):
+    """
+    Built on check_firewall_blocking()'s "precompute symptom booleans,
+    then a targeted dispatch that declines to fire without
+    corroboration" pattern. wifi_power_save == "on" (Linux-only field)
+    is normal and common by itself -- NOT flagged on its own. This only
+    fires when it's paired with an actual symptom: gateway ping loss
+    >= 20%, or jitter > 50ms -- the kind of intermittent drops/latency
+    power-saving mode is a plausible (not certain) cause of.
+    """
+    if data.get("wifi_power_save") != "on":
+        return []
+    lat = data.get("gateway_latency") or {}
+    loss = lat.get("loss_percent")
+    jitter = lat.get("jitter_ms")
+    loss_bad = loss is not None and loss >= 20
+    jitter_bad = jitter is not None and jitter > 50
+    if not (loss_bad or jitter_bad):
+        return []
+    if loss_bad and jitter_bad:
+        symptom = f"{loss}% packet loss and {jitter}ms of jitter to the router"
+    elif loss_bad:
+        symptom = f"{loss}% packet loss to the router"
+    else:
+        symptom = f"{jitter}ms of jitter to the router"
+    return [make_finding(
+        rule_id="wifi_power_saving_enabled", category="wifi", severity=SEV_WARNING,
+        target="wifi_power_save",
+        summary=(f"Wi-Fi power-saving mode is on, and this machine is also seeing {symptom} -- "
+                 "power saving can cause exactly this kind of intermittent drop/latency, "
+                 "especially on older or budget Wi-Fi adapters."),
+        detail=str({"wifi_power_save": data.get("wifi_power_save"), "gateway_latency": lat}),
+        fix_classification=FIX_GUIDED,
+        evidence={"gateway_latency": lat},
+    )]
+
+
+def check_wps_enabled(data):
+    """
+    Fires per wifi_networks entry with wps_enabled is True (Linux-only
+    field from A1's `iw scan` parser -- absent entirely on Windows/
+    macOS, read via .get() so it degrades to "no finding" there rather
+    than guessing from absence).
+
+    Scoping judgment call: scoped to the network matching
+    wifi_connection["ssid"] (the customer's own, currently-connected AP)
+    rather than firing for every nearby scanned network. Reasoning:
+    fix_classification is FIX_NONE either way (this app has no router
+    credentials to act on any of them, consumer or otherwise -- same
+    territory as CLAUDE.md's flagged web-UI-scraping decision), so
+    flagging a neighbor's router's WPS setting isn't actionable or even
+    relevant to this customer -- it would just be noise about hardware
+    they don't own. Stated honestly: this means a customer connected via
+    Ethernet (wifi_connection["ssid"] is None) whose own Wi-Fi AP is
+    still broadcasting WPS won't get this finding today, since there's
+    no connected SSID to cross-reference against -- judged an acceptable
+    gap against the noisier alternative of flagging every visible
+    network's WPS state regardless of whose it is.
+    """
+    findings = []
+    own_ssid = (data.get("wifi_connection") or {}).get("ssid")
+    if not own_ssid:
+        return findings
+    for net in data.get("wifi_networks") or []:
+        if net.get("wps_enabled") is not True:
+            continue
+        ssid = net.get("ssid")
+        if ssid != own_ssid:
+            continue
+        findings.append(make_finding(
+            rule_id="wps_enabled", category="security", severity=SEV_WARNING,
+            target=ssid,
+            summary=(f"Your Wi-Fi network ('{ssid}') has WPS (Wi-Fi Protected Setup) turned on -- "
+                     "a known weaker way to connect to a router. Fixing this means logging into "
+                     "the router directly and turning WPS off; this app can't do it for you."),
+            detail=str(net), fix_classification=FIX_NONE,
+            evidence={"wifi_network": net},
+        ))
+    return findings
+
+
+def check_clock_not_synced(data):
+    """
+    Fires when A1's clock_drift.synchronized is explicitly False -- never
+    on None, which means the OS-level check itself couldn't determine
+    sync status (e.g. macOS needing root for systemsetup), and guessing
+    "not synced" from that would be exactly the confidently-wrong shape
+    this codebase keeps catching and fixing elsewhere.
+
+    fix_classification is FIX_AUTO -- the first use of FIX_AUTO in this
+    codebase, alongside check_dns_not_resolving()'s v0.9.0 upgrade (see
+    this version's CHANGELOG entry for the full reasoning). An NTP
+    resync is judged safe and reversible with no real user tradeoff,
+    unlike every FIX_GUIDED rule in this file. A3 (Fix Engine) doesn't
+    exist yet, so today this only labels the data -- nothing actually
+    auto-executes from it.
+    """
+    clock = data.get("clock_drift") or {}
+    if clock.get("synchronized") is False:
+        return [make_finding(
+            rule_id="clock_not_synced", category="lan", severity=SEV_WARNING,
+            target="system_clock",
+            summary=("This computer's clock is not synchronized with an internet time server -- "
+                     "a wrong system clock can cause secure website connections, banking apps, "
+                     "and other services to fail in confusing ways."),
+            detail=str(clock), fix_classification=FIX_AUTO,
+            evidence={"clock_drift": clock},
+        )]
+    return []
+
+
+def check_high_jitter(data):
+    """
+    Fires when gateway_latency.jitter_ms is not None and > 30ms. 30ms
+    clears the same bar v0.8.0's MTU rule was rejected on, but in the
+    other direction: it's a genuinely standard, widely-cited "noticeable
+    for real-time traffic" jitter threshold (VoIP/video-call quality
+    guidance consistently puts acceptable jitter well under this), not a
+    customer/context-specific value the way MTU is. Purely diagnostic --
+    severity=info, fix_classification=FIX_NONE.
+    """
+    lat = data.get("gateway_latency") or {}
+    jitter = lat.get("jitter_ms")
+    if jitter is not None and jitter > 30:
+        return [make_finding(
+            rule_id="gateway_high_jitter", category="lan", severity=SEV_INFO,
+            target="gateway_jitter",
+            summary=(f"Latency to your router is inconsistent (jitter of {jitter}ms) -- this can "
+                     "cause choppy voice/video calls even when your overall connection speed "
+                     "looks fine."),
+            detail=str(lat), fix_classification=FIX_NONE,
+            evidence={"gateway_latency": lat},
+        )]
+    return []
+
+
+def check_throughput_critically_low(data):
+    """
+    Fires when throughput.mbps is not None and < 1.0. Deliberately a
+    conservative absolute floor -- "basically not working" regardless of
+    what plan the customer is paying for, not a judgment about being
+    "slow" relative to an unknown ISP speed tier this app has no way to
+    know. fix_classification is FIX_NONE for the same reason: no basis
+    to suggest a specific fix beyond "your connection is basically not
+    working right now."
+    """
+    throughput = data.get("throughput") or {}
+    mbps = throughput.get("mbps")
+    if mbps is not None and mbps < 1.0:
+        return [make_finding(
+            rule_id="throughput_critically_low", category="wan", severity=SEV_WARNING,
+            target="throughput",
+            summary=(f"Download speed measured at only {mbps} Mbps -- your internet connection "
+                     "is barely working right now, regardless of what speed you're paying for."),
+            detail=str(throughput), fix_classification=FIX_NONE,
+            evidence={"throughput": throughput},
         )]
     return []
 
@@ -819,6 +1571,21 @@ RULES = [
     check_interface_dns_missing,
     check_dns_not_resolving,
     check_firewall_blocking,
+    # -- v0.9.0 additions below --
+    check_rogue_dhcp,
+    check_duplicate_ip,
+    check_multiple_default_routes,
+    check_hosts_file_hijack,
+    check_proxy_configured,
+    check_vpn_active,
+    check_pmtu_blackhole_finding,
+    check_captive_portal_finding,
+    check_wifi_weak_signal,
+    check_wifi_power_saving_enabled,
+    check_wps_enabled,
+    check_clock_not_synced,
+    check_high_jitter,
+    check_throughput_critically_low,
 ]
 
 
